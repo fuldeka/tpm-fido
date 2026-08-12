@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/psanford/tpm-fido/attestation"
+	"github.com/psanford/tpm-fido/ctlsocket"
 	"github.com/psanford/tpm-fido/fidoauth"
 	"github.com/psanford/tpm-fido/fidohid"
 	"github.com/psanford/tpm-fido/memory"
@@ -30,6 +31,7 @@ var backend = flag.String("backend", "tpm", "tpm|memory")
 var device = flag.String("device", "/dev/tpmrm0", "TPM device path")
 var residentStorePath = flag.String("resident-store", "", "path to resident (discoverable) credential metadata store; defaults to $XDG_CONFIG_HOME/tpm-fido/resident-credentials.json")
 var pinStorePath = flag.String("pin-store", "", "path to PIN hash/retry-counter store; defaults to $XDG_CONFIG_HOME/tpm-fido/pin-state.json")
+var ctlSocketPath = flag.String("ctl-socket", "", "path to the local control-socket used by companion tools (e.g. a tray app); defaults to $XDG_RUNTIME_DIR/tpm-fido.sock")
 
 func main() {
 	flag.Parse()
@@ -129,6 +131,12 @@ func (s *server) run() {
 	}
 
 	go token.Run(ctx)
+
+	go func() {
+		if err := ctlsocket.Listen(*ctlSocketPath, s.handleCtlRequest); err != nil {
+			log.Printf("control socket error: %s", err)
+		}
+	}()
 
 	for evt := range token.Events() {
 		if evt.Error != nil {
