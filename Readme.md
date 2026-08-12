@@ -14,26 +14,48 @@ On an authentication request, tpm-fido will attempt to load the primary key by i
 
 ## CTAP2 / resident (discoverable) credentials
 
-tpm-fido also implements a subset of CTAP2 over the same HID transport: `authenticatorGetInfo`, `authenticatorMakeCredential`, `authenticatorGetAssertion`, and a read/delete subset of `authenticatorCredentialManagement` (getCredsMetadata, enumerateRPs, enumerateCredentials, deleteCredential). This is what lets tpm-fido register as a **resident/discoverable key** ("passkey"), which sites like GitHub require — the original U2F-only implementation cannot satisfy that requirement, since resident keys are a CTAP2-only concept with no equivalent in the U2F protocol.
+tpm-fido also implements a subset of CTAP2 over the same HID transport: `authenticatorGetInfo`, `authenticatorMakeCredential`, `authenticatorGetAssertion`, `authenticatorClientPIN` (PIN/UV Auth Protocol One: getKeyAgreement, setPIN, changePIN, getPINToken), and a read/delete subset of `authenticatorCredentialManagement` (getCredsMetadata, enumerateRPs, enumerateCredentials, deleteCredential). This is what lets tpm-fido register as a **resident/discoverable key** ("passkey") with PIN-based user verification, which sites like GitHub require — the original U2F-only implementation cannot satisfy that requirement, since resident keys and PIN-based UV are CTAP2-only concepts with no equivalent in the U2F protocol.
 
-Discoverable credential metadata (rpId, user id/name, credential id, a per-credential sign counter) is persisted to `$XDG_CONFIG_HOME/tpm-fido/resident-credentials.json` (override with `-resident-store <path>`). Only metadata needed to locate and re-derive a credential is stored there; the private key material stays TPM-sealed inside the credential's own key handle exactly as in the U2F flow, so a leaked store file alone does not expose signing keys when using the `tpm` backend.
+Discoverable credential metadata (rpId, user id/name, credential id, a per-credential sign counter) is persisted to `$XDG_CONFIG_HOME/tpm-fido/resident-credentials.json` (override with `-resident-store <path>`). The PIN's hash and retry counter are persisted to `$XDG_CONFIG_HOME/tpm-fido/pin-state.json` (override with `-pin-store <path>`) — the PIN itself is never stored, only left-16-bytes-of-SHA-256(PIN). Only metadata needed to locate and re-derive a credential is stored there; the private key material stays TPM-sealed inside the credential's own key handle exactly as in the U2F flow, so a leaked store file alone does not expose signing keys when using the `tpm` backend.
 
 Non-resident (classic allowList-based) WebAuthn and legacy U2F both continue to work unchanged and require no local state.
 
+CTAPHID_CANCEL is supported: canceling an in-progress registration/authentication from the browser (e.g. clicking "Cancel" on the PIN/presence prompt) properly aborts the pending pinentry prompt and request, rather than leaving it dangling.
+
 Known limitations of the CTAP2 support:
-- No PIN protocol (`clientPin`) — user verification is satisfied via the same pinentry user-presence prompt used for U2F, not a PIN.
 - If multiple accounts are registered as resident credentials for the same site, `authenticatorGetAssertion` always uses the most recently created one rather than surfacing an account picker.
-- Credential management enumeration/deletion works over CTAP2 (e.g. via `fido2-token -L -r` / `-D`, or a browser's own passkey manager where supported) but there's no standalone CLI for it yet.
+- Credential management enumeration/deletion works over CTAP2 (e.g. via `fido2-token -L -r` / `-D`, or a browser's own passkey manager where supported), and additionally via the `tpm-fido-tray` companion app described below.
+
+## tpm-fido-tray
+
+`tpm-fido-tray` is an optional companion GUI: a system tray icon for setting/changing the PIN and viewing/deleting resident credentials, without needing a CLI tool or relying on a browser's own (often absent) PIN-setup UI. It talks to the running `tpm-fido` daemon over a local Unix control socket (`$XDG_RUNTIME_DIR/tpm-fido.sock` by default) — it never touches the TPM, HID device, or on-disk stores directly.
+
+If `tpm-fido-tray` is found on `$PATH`, the `tpm-fido` daemon launches it automatically once its control socket is ready (pass `-no-tray` to disable this). It can also be launched manually or from an application menu.
+
+Requires GTK3 and `libayatana-appindicator3` (or `libappindicator3`) at build and run time — see Dependencies below.
 
 ## Status
 
-tpm-fido has been tested to work with Chrome and Firefox on Linux, including CTAP2 resident-key registration/authentication against webauthn.io and GitHub.
+tpm-fido has been tested to work with Chrome and Firefox on Linux, including CTAP2 resident-key registration/authentication with PIN-based user verification against webauthn.io and GitHub.
 
-## Building
+## Installation
 
 ```
-# in the root directory of tpm-fido run:
-go build
+git clone https://github.com/idkreally001/tpm-fido
+cd tpm-fido
+make install
+```
+
+This builds both `tpm-fido` and `tpm-fido-tray` and installs them to `~/.local/bin`, along with a `.desktop` entry so `tpm-fido` starts automatically on login (`~/.config/autostart/tpm-fido.desktop`) and an application-menu entry for `tpm-fido-tray` (`~/.local/share/applications/tpm-fido-tray.desktop`). Make sure `~/.local/bin` is on your `$PATH`.
+
+To remove everything the installer added:
+```
+make uninstall
+```
+
+To just build the binaries without installing anything system-wide:
+```
+make build
 ```
 
 ## Running
@@ -49,14 +71,15 @@ KERNEL=="uhid", SUBSYSTEM=="misc", GROUP="SOME_UHID_GROUP_MY_USER_BELONGS_TO", M
 
 To ensure the above udev rule gets triggered, I also add the `uhid` module to `/etc/modules-load.d/uhid.conf` so that it loads at boot.
 
-To run:
+To run (after `make install`, or from `./tpm-fido` in the repo root after `make build`):
 
 ```
 # as a user that has permission to read and write to /dev/tpmrm0:
-./tpm-fido
+tpm-fido
 ```
 Note: do not run with `sudo` or as root, as it will not work.
 
 ## Dependencies
 
-tpm-fido requires `pinentry` to be available on the system. If you have gpg installed you most likely already have `pinentry`.
+- `pinentry` must be available on the system for presence/PIN confirmation prompts. If you have gpg installed you most likely already have `pinentry`.
+- Building/running `tpm-fido-tray` additionally requires GTK3 (`gtk3` / `libgtk-3-dev`) and an AppIndicator library (`libayatana-appindicator` on modern distros, or `libappindicator3` on older ones) for the system tray icon. `tpm-fido` itself has no GUI dependency beyond `pinentry`.

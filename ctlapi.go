@@ -142,7 +142,7 @@ func (s *server) handleCtlRequest(method string, params json.RawMessage) (interf
 		}
 		// Any previously issued CTAP2 pinUvAuthToken is invalidated by a
 		// PIN change, same as the ClientPIN changePIN subcommand.
-		s.pinToken = nil
+		s.setPinToken(nil)
 		return struct{}{}, nil
 
 	default:

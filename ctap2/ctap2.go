@@ -51,10 +51,14 @@ const (
 	StatusSuccess            byte = 0x00
 	StatusInvalidCommand     byte = 0x01
 	StatusInvalidCredential  byte = 0x22
+	StatusMissingParameter   byte = 0x14
 	StatusCredentialExcluded byte = 0x19
+	StatusKeepAliveCancel    byte = 0x2D
 	StatusNoCredentials      byte = 0x2E
 	StatusOperationDenied    byte = 0x27
 	StatusUnsupportedOption  byte = 0x2C
+	StatusPinAuthInvalid     byte = 0x33 // pinUvAuthParam was supplied but did not verify
+	StatusPinRequired        byte = 0x36 // pinUvAuthParam was required but not supplied at all
 	StatusOther              byte = 0x7F
 )
 
@@ -115,23 +119,27 @@ type userEntity struct {
 // MakeCredentialRequest is the decoded subset of the CTAP2
 // authenticatorMakeCredential request parameters this authenticator uses.
 type MakeCredentialRequest struct {
-	ClientDataHash   []byte
-	RP               rpEntity
-	User             userEntity
-	PubKeyCredParams []pubKeyCredParam
-	ExcludeList      [][]byte
-	ResidentKey      bool
-	UserVerification bool
+	ClientDataHash    []byte
+	RP                rpEntity
+	User              userEntity
+	PubKeyCredParams  []pubKeyCredParam
+	ExcludeList       [][]byte
+	ResidentKey       bool
+	UserVerification  bool
+	PinUvAuthParam    []byte
+	PinUvAuthProtocol int
 }
 
 type makeCredentialCbor struct {
-	ClientDataHash   []byte                 `cbor:"1,keyasint"`
-	RP               rpEntity               `cbor:"2,keyasint"`
-	User             userEntity             `cbor:"3,keyasint"`
-	PubKeyCredParams []pubKeyCredParam      `cbor:"4,keyasint"`
-	ExcludeList      []credDescriptor       `cbor:"5,keyasint,omitempty"`
-	Extensions       map[string]interface{} `cbor:"6,keyasint,omitempty"`
-	Options          map[string]bool        `cbor:"7,keyasint,omitempty"`
+	ClientDataHash    []byte                 `cbor:"1,keyasint"`
+	RP                rpEntity               `cbor:"2,keyasint"`
+	User              userEntity             `cbor:"3,keyasint"`
+	PubKeyCredParams  []pubKeyCredParam      `cbor:"4,keyasint"`
+	ExcludeList       []credDescriptor       `cbor:"5,keyasint,omitempty"`
+	Extensions        map[string]interface{} `cbor:"6,keyasint,omitempty"`
+	Options           map[string]bool        `cbor:"7,keyasint,omitempty"`
+	PinUvAuthParam    []byte                 `cbor:"8,keyasint,omitempty"`
+	PinUvAuthProtocol int                    `cbor:"9,keyasint,omitempty"`
 }
 
 func DecodeMakeCredentialRequest(body []byte) (*MakeCredentialRequest, error) {
@@ -148,10 +156,12 @@ func DecodeMakeCredentialRequest(body []byte) (*MakeCredentialRequest, error) {
 	}
 
 	out := &MakeCredentialRequest{
-		ClientDataHash:   req.ClientDataHash,
-		RP:               req.RP,
-		User:             req.User,
-		PubKeyCredParams: req.PubKeyCredParams,
+		ClientDataHash:    req.ClientDataHash,
+		RP:                req.RP,
+		User:              req.User,
+		PubKeyCredParams:  req.PubKeyCredParams,
+		PinUvAuthParam:    req.PinUvAuthParam,
+		PinUvAuthProtocol: req.PinUvAuthProtocol,
 	}
 	for _, c := range req.ExcludeList {
 		out.ExcludeList = append(out.ExcludeList, c.ID)
@@ -267,10 +277,12 @@ func EncodeMakeCredentialResponse(authData []byte, sig []byte, attestationCertDE
 }
 
 type getAssertionCbor struct {
-	RPID           string           `cbor:"1,keyasint"`
-	ClientDataHash []byte           `cbor:"2,keyasint"`
-	AllowList      []credDescriptor `cbor:"3,keyasint,omitempty"`
-	Options        map[string]bool  `cbor:"5,keyasint,omitempty"`
+	RPID              string           `cbor:"1,keyasint"`
+	ClientDataHash    []byte           `cbor:"2,keyasint"`
+	AllowList         []credDescriptor `cbor:"3,keyasint,omitempty"`
+	Options           map[string]bool  `cbor:"5,keyasint,omitempty"`
+	PinUvAuthParam    []byte           `cbor:"6,keyasint,omitempty"`
+	PinUvAuthProtocol int              `cbor:"7,keyasint,omitempty"`
 }
 
 type credDescriptor struct {
@@ -279,11 +291,13 @@ type credDescriptor struct {
 }
 
 type GetAssertionRequest struct {
-	RPID             string
-	ClientDataHash   []byte
-	AllowList        [][]byte
-	UserPresence     bool
-	UserVerification bool
+	RPID              string
+	ClientDataHash    []byte
+	AllowList         [][]byte
+	UserPresence      bool
+	UserVerification  bool
+	PinUvAuthParam    []byte
+	PinUvAuthProtocol int
 }
 
 func DecodeGetAssertionRequest(body []byte) (*GetAssertionRequest, error) {
@@ -300,8 +314,10 @@ func DecodeGetAssertionRequest(body []byte) (*GetAssertionRequest, error) {
 	}
 
 	out := &GetAssertionRequest{
-		RPID:           req.RPID,
-		ClientDataHash: req.ClientDataHash,
+		RPID:              req.RPID,
+		ClientDataHash:    req.ClientDataHash,
+		PinUvAuthParam:    req.PinUvAuthParam,
+		PinUvAuthProtocol: req.PinUvAuthProtocol,
 		// up defaults to true per CTAP2 spec unless explicitly set false
 		// (used by clients for a silent/conditional-mediation probe).
 		UserPresence: true,

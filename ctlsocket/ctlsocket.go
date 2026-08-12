@@ -46,7 +46,12 @@ func DefaultPath() (string, error) {
 // closed or the process exits; intended to be run in its own goroutine.
 // The socket is created with 0600 permissions (owner-only) since it grants
 // PIN-gated credential management access.
-func Listen(path string, handle Handler) error {
+//
+// If ready is non-nil, it's closed once the socket is bound and accepting
+// connections -- callers that need to know the daemon is reachable before
+// doing something else (e.g. launching a companion UI that immediately
+// calls PINStatus) should wait on it rather than guessing with a sleep.
+func Listen(path string, handle Handler, ready chan<- struct{}) error {
 	if path == "" {
 		var err error
 		path, err = DefaultPath()
@@ -73,6 +78,10 @@ func Listen(path string, handle Handler) error {
 	if err := os.Chmod(path, 0o600); err != nil {
 		l.Close()
 		return fmt.Errorf("chmod control socket: %w", err)
+	}
+
+	if ready != nil {
+		close(ready)
 	}
 
 	for {

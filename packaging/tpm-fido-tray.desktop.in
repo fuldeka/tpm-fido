@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=tpm-fido Manager
+Comment=Manage tpm-fido PIN and resident credentials
+Exec=@BINDIR@/tpm-fido-tray
+Icon=@ICON@
+Terminal=false
+Categories=Utility;Security;

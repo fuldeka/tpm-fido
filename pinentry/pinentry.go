@@ -26,6 +26,10 @@ type request struct {
 	timeout       time.Duration
 	pendingResult chan Result
 	extendTimeout chan time.Duration
+	done          chan struct{}
+
+	mu     sync.Mutex
+	cancel context.CancelFunc
 
 	challengeParam   [32]byte
 	applicationParam [32]byte
@@ -36,7 +40,14 @@ type Result struct {
 	Error error
 }
 
-func (pe *Pinentry) ConfirmPresence(prompt string, challengeParam, applicationParam [32]byte) (chan Result, error) {
+// ConfirmPresence prompts the user via pinentry and returns a channel that
+// receives the result. If callerCtx is canceled (e.g. the CTAP2 request that
+// initiated this prompt received a CTAPHID_CANCEL) before the user responds,
+// the pinentry subprocess is killed and the pending result resolves to
+// OK:false, same as an explicit user cancel -- otherwise a canceled request
+// would leave the dialog open on screen and its stale activeRequest entry
+// would keep absorbing/extending unrelated later requests.
+func (pe *Pinentry) ConfirmPresence(callerCtx context.Context, prompt string, challengeParam, applicationParam [32]byte) (chan Result, error) {
 	pe.mu.Lock()
 	defer pe.mu.Unlock()
 
@@ -56,20 +67,40 @@ func (pe *Pinentry) ConfirmPresence(prompt string, challengeParam, applicationPa
 			}
 		}()
 
+		go watchCancel(callerCtx, pe.activeRequest)
+
 		return pe.activeRequest.pendingResult, nil
 	}
 
-	pe.activeRequest = &request{
+	req := &request{
 		timeout:          timeout,
 		challengeParam:   challengeParam,
 		applicationParam: applicationParam,
 		pendingResult:    make(chan Result),
 		extendTimeout:    make(chan time.Duration),
+		done:             make(chan struct{}),
 	}
+	pe.activeRequest = req
 
-	go pe.prompt(pe.activeRequest, prompt)
+	go pe.prompt(req, prompt)
+	go watchCancel(callerCtx, req)
 
-	return pe.activeRequest.pendingResult, nil
+	return req.pendingResult, nil
+}
+
+// watchCancel kills req's pinentry subprocess if callerCtx is canceled
+// before the request resolves on its own (result delivered or timed out).
+func watchCancel(callerCtx context.Context, req *request) {
+	select {
+	case <-callerCtx.Done():
+		req.mu.Lock()
+		cancel := req.cancel
+		req.mu.Unlock()
+		if cancel != nil {
+			cancel()
+		}
+	case <-req.done:
+	}
 }
 
 func (pe *Pinentry) prompt(req *request, prompt string) {
@@ -82,6 +113,8 @@ func (pe *Pinentry) prompt(req *request, prompt string) {
 			// is likely gone.
 		}
 
+		close(req.done)
+
 		pe.mu.Lock()
 		pe.activeRequest = nil
 		pe.mu.Unlock()
@@ -89,6 +122,11 @@ func (pe *Pinentry) prompt(req *request, prompt string) {
 
 	childCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	req.mu.Lock()
+	req.cancel = cancel
+	req.mu.Unlock()
+
 	p, cmd, err := launchPinEntry(childCtx)
 	if err != nil {
 		sendResult(Result{

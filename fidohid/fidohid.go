@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"sync"
 
 	"github.com/psanford/tpm-fido/fidoauth"
 	"github.com/psanford/uhid"
@@ -32,6 +33,7 @@ func New(ctx context.Context, name string) (*SoftToken, error) {
 		device:    d,
 		evtChan:   evtChan,
 		authEvent: make(chan AuthEvent),
+		cancelFns: make(map[uint32]context.CancelFunc),
 	}
 
 	return &t, nil
@@ -43,6 +45,13 @@ type SoftToken struct {
 	authEvent chan AuthEvent
 
 	authFunc func()
+
+	// cancelFns holds the cancel func for each channel's in-flight
+	// request, if any, so an incoming CTAPHID_CANCEL packet can abort it.
+	// Guarded by cancelMu since it's written by Run's packet-reading
+	// goroutine and read/deleted from request-handling goroutines.
+	cancelMu  sync.Mutex
+	cancelFns map[uint32]context.CancelFunc
 }
 
 type AuthEvent struct {
@@ -52,6 +61,14 @@ type AuthEvent struct {
 	Req   *fidoauth.AuthenticatorRequest
 	Cbor  []byte
 	Error error
+
+	// Ctx is canceled if the platform sends CTAPHID_CANCEL for this
+	// request's channel while it's still being handled. Handlers that can
+	// block for a long time (waiting on user presence/PIN entry) should
+	// select on Ctx.Done() and abort the operation without writing a
+	// response, matching real authenticator behavior for a canceled
+	// request.
+	Ctx context.Context
 }
 
 func (e AuthEvent) IsCbor() bool {
@@ -123,6 +140,7 @@ func (t *SoftToken) Run(ctx context.Context) {
 				continue
 			}
 		case CmdMsg:
+			reqCtx := t.registerRequest(reqChanID)
 			req, err := fidoauth.DecodeAuthenticatorRequest(innerMsg)
 
 			evt := AuthEvent{
@@ -130,6 +148,7 @@ func (t *SoftToken) Run(ctx context.Context) {
 				cmd:    cmd,
 				Req:    req,
 				Error:  err,
+				Ctx:    reqCtx,
 			}
 
 			select {
@@ -138,10 +157,12 @@ func (t *SoftToken) Run(ctx context.Context) {
 				return
 			}
 		case CmdCbor:
+			reqCtx := t.registerRequest(reqChanID)
 			evt := AuthEvent{
 				chanID: reqChanID,
 				cmd:    cmd,
 				Cbor:   innerMsg,
+				Ctx:    reqCtx,
 			}
 
 			select {
@@ -149,11 +170,56 @@ func (t *SoftToken) Run(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			}
+		case CmdCancel:
+			// Per CTAPHID spec, CANCEL takes no response -- it just aborts
+			// whatever request is currently in flight on this channel, if
+			// any. If nothing is in flight (already completed, or nothing
+			// was ever started), this is a no-op.
+			t.cancelRequest(reqChanID)
 		default:
 			log.Printf("unsuppoted cmd: %s %d", cmd, cmd)
 			writeRespose(t.device, reqChanID, cmd, nil, swInsNotSupported)
 		}
 	}
+}
+
+// registerRequest records a cancelable context for chanID's new in-flight
+// request, replacing (and canceling) any previous one on the same channel --
+// a platform is only ever supposed to have one request outstanding per
+// channel, but this keeps a stray leftover from leaking if it does.
+func (t *SoftToken) registerRequest(chanID uint32) context.Context {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	t.cancelMu.Lock()
+	if prev, ok := t.cancelFns[chanID]; ok {
+		prev()
+	}
+	t.cancelFns[chanID] = cancel
+	t.cancelMu.Unlock()
+
+	return ctx
+}
+
+// cancelRequest aborts chanID's in-flight request, if any.
+func (t *SoftToken) cancelRequest(chanID uint32) {
+	t.cancelMu.Lock()
+	cancel, ok := t.cancelFns[chanID]
+	delete(t.cancelFns, chanID)
+	t.cancelMu.Unlock()
+
+	if ok {
+		cancel()
+	}
+}
+
+// clearRequest marks chanID's in-flight request as complete, without
+// canceling it -- called once a handler has finished (successfully or not)
+// so a later CANCEL for an already-finished request is a harmless no-op
+// rather than canceling some unrelated later request that reused the slot.
+func (t *SoftToken) clearRequest(chanID uint32) {
+	t.cancelMu.Lock()
+	delete(t.cancelFns, chanID)
+	t.cancelMu.Unlock()
 }
 
 const (
@@ -165,14 +231,16 @@ const (
 	frameTypeInit = 0x80
 	frameTypeCont = 0x00
 
-	CmdPing  CmdType = 0x01 // Echo data through local processor only
-	CmdMsg   CmdType = 0x03 // Send U2F message frame
-	CmdLock  CmdType = 0x04 // Send lock channel command
-	CmdInit  CmdType = 0x06 // Channel initialization
-	CmdWink  CmdType = 0x08 // Send device identification wink
-	CmdCbor  CmdType = 0x10 // Send encapsulated CTAP CBOR
-	CmdSync  CmdType = 0x3c // Protocol resync command
-	CmdError CmdType = 0x3f // Error response
+	CmdPing      CmdType = 0x01 // Echo data through local processor only
+	CmdMsg       CmdType = 0x03 // Send U2F message frame
+	CmdLock      CmdType = 0x04 // Send lock channel command
+	CmdInit      CmdType = 0x06 // Channel initialization
+	CmdWink      CmdType = 0x08 // Send device identification wink
+	CmdCbor      CmdType = 0x10 // Send encapsulated CTAP CBOR
+	CmdCancel    CmdType = 0x11 // Cancel any outstanding request on this channel
+	CmdKeepAlive CmdType = 0x3b // Sent while a request is still being processed
+	CmdSync      CmdType = 0x3c // Protocol resync command
+	CmdError     CmdType = 0x3f // Error response
 
 	vendorSpecificFirstCmd = 0x40
 	vendorSpecificLastCmd  = 0x7f
@@ -471,6 +539,7 @@ func (resp *initResponse) Marshal() []byte {
 }
 
 func (t *SoftToken) WriteResponse(ctx context.Context, evt AuthEvent, data []byte, status uint16) error {
+	t.clearRequest(evt.chanID)
 	return writeRespose(t.device, evt.chanID, evt.cmd, data, status)
 }
 
@@ -478,6 +547,7 @@ func (t *SoftToken) WriteResponse(ctx context.Context, evt AuthEvent, data []byt
 // (ctap2Status, 0x00 = success) followed by the raw CBOR body. Unlike
 // WriteResponse (U2F), the status is not a trailing 2-byte SW.
 func (t *SoftToken) WriteCborResponse(ctx context.Context, evt AuthEvent, cborBody []byte, ctap2Status byte) error {
+	t.clearRequest(evt.chanID)
 	data := append([]byte{ctap2Status}, cborBody...)
 	log.Printf("WriteCborResponse cmd=%s chanID=%d status=0x%02x len=%d", evt.cmd, evt.chanID, ctap2Status, len(data))
 	return writeRespose(t.device, evt.chanID, evt.cmd, data, 0)

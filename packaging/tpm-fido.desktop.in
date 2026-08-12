@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=tpm-fido
+Comment=TPM-backed FIDO2/U2F authenticator daemon
+Exec=@BINDIR@/tpm-fido -backend tpm
+Icon=@ICON@
+Terminal=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true
