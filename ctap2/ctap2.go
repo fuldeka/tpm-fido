@@ -77,12 +77,22 @@ type getInfoResponse struct {
 }
 
 // EncodeGetInfoResponse builds the authenticatorGetInfo CBOR response body.
-// rk:true + up:true + uv:true advertise resident-key, user-presence and
-// (pinentry-backed) user-verification support so GitHub and other RPs that
-// require rk will accept this authenticator. clientPin reflects whether a
-// PIN has actually been set (CTAP2 clients, notably libfido2, gate
-// credential-management access on this being true, so it must track real
-// PIN state rather than being hardcoded).
+// rk:true + up:true advertise resident-key and user-presence support so
+// GitHub and other RPs that require rk will accept this authenticator.
+// clientPin reflects whether a PIN has actually been set (CTAP2 clients,
+// notably libfido2, gate credential-management access on this being true,
+// so it must track real PIN state rather than being hardcoded).
+//
+// The "uv" option is deliberately omitted (rather than set true): per
+// CTAP2 spec, "uv" means the authenticator has a *built-in* user
+// verification method (fingerprint, face, on-device PIN pad) that it can
+// satisfy without any pinUvAuthParam round-trip. This authenticator has no
+// such thing -- its only UV mechanism is PIN-via-platform, which is
+// already correctly signaled by clientPin/pinUvAuthProtocols. Advertising
+// uv:true here previously made at least Chrome behave as though built-in
+// UV should be attempted instead of the PIN protocol, so it never issued
+// a getKeyAgreement/getPINToken request at all and just retried
+// MakeCredential in a loop, always failing PIN_REQUIRED.
 func EncodeGetInfoResponse(clientPinSet bool) ([]byte, error) {
 	resp := getInfoResponse{
 		Versions: []string{"U2F_V2", "FIDO_2_0"},
@@ -90,7 +100,6 @@ func EncodeGetInfoResponse(clientPinSet bool) ([]byte, error) {
 		Options: map[string]bool{
 			"rk":        true,
 			"up":        true,
-			"uv":        true,
 			"plat":      false,
 			"clientPin": clientPinSet,
 			"credMgmt":  true,
@@ -498,7 +507,10 @@ func EncodeEnumerateCredentialResponse(credID []byte, userID []byte, userName st
 // getPinUvAuthTokenUsingPinWithPermissions and is what libfido2 uses by
 // default; the newer permissions-scoped variant (0x09) is not implemented
 // since this authenticator has no permission-scoping to enforce.
+// getPINRetries (0x01) is called by some platforms (e.g. Chrome) before
+// getKeyAgreement to decide whether/how to prompt for a PIN.
 const (
+	ClientPINSubGetPINRetries   = 0x01
 	ClientPINSubGetKeyAgreement = 0x02
 	ClientPINSubSetPIN          = 0x03
 	ClientPINSubChangePIN       = 0x04
@@ -571,5 +583,20 @@ type clientPINGetTokenResponse struct {
 // subcommand: the pinUvAuthToken, encrypted with the shared secret.
 func EncodeClientPINTokenResponse(encryptedToken []byte) ([]byte, error) {
 	resp := clientPINGetTokenResponse{PinUvAuthToken: encryptedToken}
+	return ctap2EncMode.Marshal(resp)
+}
+
+type clientPINGetRetriesResponse struct {
+	PinRetries int `cbor:"3,keyasint"`
+}
+
+// EncodeClientPINRetriesResponse builds the response for the
+// getPINRetries subcommand: how many PIN attempts remain before lockout.
+// Some CTAP2 platforms (e.g. Chrome) call this before getKeyAgreement to
+// decide whether/how to prompt the user, so an authenticator that doesn't
+// implement it can leave the platform stuck never attempting the PIN
+// protocol at all.
+func EncodeClientPINRetriesResponse(retriesLeft int) ([]byte, error) {
+	resp := clientPINGetRetriesResponse{PinRetries: retriesLeft}
 	return ctap2EncMode.Marshal(resp)
 }

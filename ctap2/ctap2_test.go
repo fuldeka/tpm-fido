@@ -276,6 +276,22 @@ func TestDecodeGetAssertionRequestPinUvAuthParam(t *testing.T) {
 	}
 }
 
+func TestEncodeClientPINRetriesResponse(t *testing.T) {
+	body, err := EncodeClientPINRetriesResponse(5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded struct {
+		PinRetries int `cbor:"3,keyasint"`
+	}
+	if err := cbor.Unmarshal(body, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.PinRetries != 5 {
+		t.Fatalf("expected pinRetries=5, got %d", decoded.PinRetries)
+	}
+}
+
 func TestDecodeGetAssertionRequestValidation(t *testing.T) {
 	if _, err := DecodeGetAssertionRequest([]byte{0xA0}); err == nil {
 		t.Fatal("expected error for missing rpId")

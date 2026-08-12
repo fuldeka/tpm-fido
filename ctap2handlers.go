@@ -541,11 +541,12 @@ func (s *server) rpIDForCredential(credID []byte) string {
 }
 
 // handleClientPIN implements the subset of authenticatorClientPIN (PIN/UV
-// Auth Protocol One) needed for CTAP2 clients like libfido2 to obtain a
-// pinUvAuthToken and use it for credential management: getKeyAgreement,
-// setPIN, changePIN, getPINToken. The PIN itself never touches disk or
-// pinentry -- only its hash (via the platform-computed pinHashEnc) is ever
-// seen, and only in memory during verification.
+// Auth Protocol One) needed for CTAP2 clients like libfido2 and Chrome to
+// obtain a pinUvAuthToken and use it for credential management:
+// getPINRetries, getKeyAgreement, setPIN, changePIN, getPINToken. The PIN
+// itself never touches disk or pinentry -- only its hash (via the
+// platform-computed pinHashEnc) is ever seen, and only in memory during
+// verification.
 func (s *server) handleClientPIN(parentCtx context.Context, token *fidohid.SoftToken, evt fidohid.AuthEvent, body []byte) {
 	req, err := ctap2.DecodeClientPINRequest(body)
 	if err != nil {
@@ -555,6 +556,15 @@ func (s *server) handleClientPIN(parentCtx context.Context, token *fidohid.SoftT
 	}
 
 	switch req.SubCommand {
+	case ctap2.ClientPINSubGetPINRetries:
+		resp, err := ctap2.EncodeClientPINRetriesResponse(s.pins.RetriesLeft())
+		if err != nil {
+			log.Printf("EncodeClientPINRetriesResponse err: %s", err)
+			token.WriteCborResponse(parentCtx, evt, nil, ctap2.StatusOther)
+			return
+		}
+		token.WriteCborResponse(parentCtx, evt, resp, ctap2.StatusSuccess)
+
 	case ctap2.ClientPINSubGetKeyAgreement:
 		x, y := s.keyAgreement.PublicKeyXY()
 		resp, err := ctap2.EncodeClientPINKeyAgreementResponse(x, y)
