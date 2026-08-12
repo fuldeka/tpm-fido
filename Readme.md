@@ -12,9 +12,22 @@ A signing child key is then generated from that primary key. The key handle retu
 
 On an authentication request, tpm-fido will attempt to load the primary key by initializing the hkdf in the same manner as above. It will then attempt to load the child key from the provided key handle. Any incorrect values or values created by a different TPM will fail to load.
 
+## CTAP2 / resident (discoverable) credentials
+
+tpm-fido also implements a subset of CTAP2 over the same HID transport: `authenticatorGetInfo`, `authenticatorMakeCredential`, `authenticatorGetAssertion`, and a read/delete subset of `authenticatorCredentialManagement` (getCredsMetadata, enumerateRPs, enumerateCredentials, deleteCredential). This is what lets tpm-fido register as a **resident/discoverable key** ("passkey"), which sites like GitHub require — the original U2F-only implementation cannot satisfy that requirement, since resident keys are a CTAP2-only concept with no equivalent in the U2F protocol.
+
+Discoverable credential metadata (rpId, user id/name, credential id, a per-credential sign counter) is persisted to `$XDG_CONFIG_HOME/tpm-fido/resident-credentials.json` (override with `-resident-store <path>`). Only metadata needed to locate and re-derive a credential is stored there; the private key material stays TPM-sealed inside the credential's own key handle exactly as in the U2F flow, so a leaked store file alone does not expose signing keys when using the `tpm` backend.
+
+Non-resident (classic allowList-based) WebAuthn and legacy U2F both continue to work unchanged and require no local state.
+
+Known limitations of the CTAP2 support:
+- No PIN protocol (`clientPin`) — user verification is satisfied via the same pinentry user-presence prompt used for U2F, not a PIN.
+- If multiple accounts are registered as resident credentials for the same site, `authenticatorGetAssertion` always uses the most recently created one rather than surfacing an account picker.
+- Credential management enumeration/deletion works over CTAP2 (e.g. via `fido2-token -L -r` / `-D`, or a browser's own passkey manager where supported) but there's no standalone CLI for it yet.
+
 ## Status
 
-tpm-fido has been tested to work with Chrome and Firefox on Linux.
+tpm-fido has been tested to work with Chrome and Firefox on Linux, including CTAP2 resident-key registration/authentication against webauthn.io and GitHub.
 
 ## Building
 

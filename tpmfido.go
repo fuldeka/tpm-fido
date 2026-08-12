@@ -18,6 +18,9 @@ import (
 	"github.com/psanford/tpm-fido/fidohid"
 	"github.com/psanford/tpm-fido/memory"
 	"github.com/psanford/tpm-fido/pinentry"
+	"github.com/psanford/tpm-fido/pinprotocol"
+	"github.com/psanford/tpm-fido/pinstore"
+	"github.com/psanford/tpm-fido/residentstore"
 	"github.com/psanford/tpm-fido/sitesignatures"
 	"github.com/psanford/tpm-fido/statuscode"
 	"github.com/psanford/tpm-fido/tpm"
@@ -25,6 +28,8 @@ import (
 
 var backend = flag.String("backend", "tpm", "tpm|memory")
 var device = flag.String("device", "/dev/tpmrm0", "TPM device path")
+var residentStorePath = flag.String("resident-store", "", "path to resident (discoverable) credential metadata store; defaults to $XDG_CONFIG_HOME/tpm-fido/resident-credentials.json")
+var pinStorePath = flag.String("pin-store", "", "path to PIN hash/retry-counter store; defaults to $XDG_CONFIG_HOME/tpm-fido/pin-state.json")
 
 func main() {
 	flag.Parse()
@@ -33,8 +38,37 @@ func main() {
 }
 
 type server struct {
-	pe     *pinentry.Pinentry
-	signer Signer
+	pe       *pinentry.Pinentry
+	signer   Signer
+	resident *residentstore.Store
+	pins     *pinstore.Store
+
+	// credMgmtCursor holds pagination state for the CTAP2 credential
+	// management enumerateRPs/enumerateCredentials GetNext* calls, which
+	// are stateful across a sequence of CTAPHID requests on the same
+	// channel. Single global cursor is fine: CTAP2 clients don't
+	// interleave separate enumeration sessions.
+	credMgmtCursor credMgmtCursor
+
+	// keyAgreement is this authenticator's ECDH keypair for CTAP2 PIN/UV
+	// Auth Protocol One. Generated once at process start and reused for
+	// every getKeyAgreement call, matching how real authenticators behave
+	// for Protocol One (Protocol Two regenerates per call; not implemented
+	// here).
+	keyAgreement *pinprotocol.KeyAgreement
+
+	// pinToken is the current pinUvAuthToken, minted fresh on each
+	// successful getPINToken exchange and required (as a valid HMAC key
+	// over the request) for privileged operations. Cleared to nil on
+	// process start; a real PIN entry is required after every restart.
+	pinToken []byte
+}
+
+type credMgmtCursor struct {
+	rpIDs   []string
+	rpIdx   int
+	creds   []residentstore.Credential
+	credIdx int
 }
 
 type Signer interface {
@@ -60,6 +94,25 @@ func newServer() *server {
 		}
 		s.signer = signer
 	}
+
+	resident, err := residentstore.Open(*residentStorePath)
+	if err != nil {
+		panic(err)
+	}
+	s.resident = resident
+
+	pins, err := pinstore.Open(*pinStorePath)
+	if err != nil {
+		panic(err)
+	}
+	s.pins = pins
+
+	ka, err := pinprotocol.NewKeyAgreement()
+	if err != nil {
+		panic(err)
+	}
+	s.keyAgreement = ka
+
 	return &s
 }
 
@@ -80,6 +133,11 @@ func (s *server) run() {
 	for evt := range token.Events() {
 		if evt.Error != nil {
 			log.Printf("got token error: %s", err)
+			continue
+		}
+
+		if evt.IsCbor() {
+			s.handleCbor(ctx, token, evt)
 			continue
 		}
 

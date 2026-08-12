@@ -50,7 +50,12 @@ type AuthEvent struct {
 	cmd    CmdType
 
 	Req   *fidoauth.AuthenticatorRequest
+	Cbor  []byte
 	Error error
+}
+
+func (e AuthEvent) IsCbor() bool {
+	return e.cmd == CmdCbor
 }
 
 func (t *SoftToken) Events() chan AuthEvent {
@@ -125,6 +130,18 @@ func (t *SoftToken) Run(ctx context.Context) {
 				cmd:    cmd,
 				Req:    req,
 				Error:  err,
+			}
+
+			select {
+			case t.authEvent <- evt:
+			case <-ctx.Done():
+				return
+			}
+		case CmdCbor:
+			evt := AuthEvent{
+				chanID: reqChanID,
+				cmd:    cmd,
+				Cbor:   innerMsg,
 			}
 
 			select {
@@ -434,7 +451,7 @@ func newInitResponse(channelID uint32, nonce [8]byte) *initResponse {
 		MajorDeviceVersion: deviceMajor,
 		MinorDeviceVersion: deviceMinor,
 		BuildDeviceVersion: deviceBuild,
-		// RawCapabilities:    winkCapability,
+		RawCapabilities:    cborCapability,
 	}
 }
 
@@ -455,6 +472,15 @@ func (resp *initResponse) Marshal() []byte {
 
 func (t *SoftToken) WriteResponse(ctx context.Context, evt AuthEvent, data []byte, status uint16) error {
 	return writeRespose(t.device, evt.chanID, evt.cmd, data, status)
+}
+
+// WriteCborResponse writes a CTAP2 response: a single status byte
+// (ctap2Status, 0x00 = success) followed by the raw CBOR body. Unlike
+// WriteResponse (U2F), the status is not a trailing 2-byte SW.
+func (t *SoftToken) WriteCborResponse(ctx context.Context, evt AuthEvent, cborBody []byte, ctap2Status byte) error {
+	data := append([]byte{ctap2Status}, cborBody...)
+	log.Printf("WriteCborResponse cmd=%s chanID=%d status=0x%02x len=%d", evt.cmd, evt.chanID, ctap2Status, len(data))
+	return writeRespose(t.device, evt.chanID, evt.cmd, data, 0)
 }
 
 func writeRespose(d *uhid.Device, chanID uint32, cmd CmdType, data []byte, status uint16) error {
