@@ -50,6 +50,7 @@ const (
 const (
 	StatusSuccess            byte = 0x00
 	StatusInvalidCommand     byte = 0x01
+	StatusInvalidParameter   byte = 0x02
 	StatusInvalidCredential  byte = 0x22
 	StatusMissingParameter   byte = 0x14
 	StatusCredentialExcluded byte = 0x19
@@ -385,10 +386,11 @@ type credentialManagementCbor struct {
 }
 
 type CredentialManagementRequest struct {
-	SubCommand     byte
-	RPIDHash       []byte
-	CredID         []byte
-	PinUvAuthParam []byte
+	SubCommand        byte
+	RPIDHash          []byte
+	CredID            []byte
+	PinUvAuthProtocol int
+	PinUvAuthParam    []byte
 	// AuthenticatedMessage is subCommand||subCommandParams exactly as
 	// received (subCommandParams as raw bytes, or omitted entirely if the
 	// platform sent no params), which is the message pinUvAuthParam
@@ -413,8 +415,9 @@ func DecodeCredentialManagementRequest(body []byte) (*CredentialManagementReques
 	}
 
 	out := &CredentialManagementRequest{
-		SubCommand:     req.SubCommand,
-		PinUvAuthParam: req.PinUvAuthParam,
+		SubCommand:        req.SubCommand,
+		PinUvAuthProtocol: req.PinUvAuthProtocol,
+		PinUvAuthParam:    req.PinUvAuthParam,
 	}
 
 	out.AuthenticatedMessage = append([]byte{req.SubCommand}, req.SubCommandParams...)
@@ -537,12 +540,13 @@ type clientPINCbor struct {
 // ClientPINRequest is the decoded subset of an authenticatorClientPIN
 // request this authenticator uses.
 type ClientPINRequest struct {
-	SubCommand     byte
-	PeerKeyX       []byte
-	PeerKeyY       []byte
-	PinUvAuthParam []byte
-	NewPinEnc      []byte
-	PinHashEnc     []byte
+	SubCommand        byte
+	PinUvAuthProtocol int
+	PeerKeyX          []byte
+	PeerKeyY          []byte
+	PinUvAuthParam    []byte
+	NewPinEnc         []byte
+	PinHashEnc        []byte
 }
 
 func DecodeClientPINRequest(body []byte) (*ClientPINRequest, error) {
@@ -552,12 +556,13 @@ func DecodeClientPINRequest(body []byte) (*ClientPINRequest, error) {
 	}
 
 	return &ClientPINRequest{
-		SubCommand:     req.SubCommand,
-		PeerKeyX:       req.KeyAgreement.X,
-		PeerKeyY:       req.KeyAgreement.Y,
-		PinUvAuthParam: req.PinUvAuthParam,
-		NewPinEnc:      req.NewPinEnc,
-		PinHashEnc:     req.PinHashEnc,
+		SubCommand:        req.SubCommand,
+		PinUvAuthProtocol: req.PinUvAuthProtocol,
+		PeerKeyX:          req.KeyAgreement.X,
+		PeerKeyY:          req.KeyAgreement.Y,
+		PinUvAuthParam:    req.PinUvAuthParam,
+		NewPinEnc:         req.NewPinEnc,
+		PinHashEnc:        req.PinHashEnc,
 	}, nil
 }
 

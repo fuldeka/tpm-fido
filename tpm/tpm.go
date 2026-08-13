@@ -8,6 +8,7 @@ import (
 	"io"
 	"math/big"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/go-tpm/tpm2"
@@ -25,6 +26,14 @@ var (
 type TPM struct {
 	devicePath string
 	mu         sync.Mutex
+
+	// lastCounter tracks the highest value Counter() has ever returned,
+	// so two signatures issued within the same wall-clock second (e.g.
+	// GetAssertion for two different non-resident credentials in quick
+	// succession) still get strictly increasing values instead of a tie
+	// -- a tie or decrease is what RPs use to flag a cloned/replayed
+	// authenticator.
+	lastCounter uint32
 }
 
 func (t *TPM) open() (io.ReadWriteCloser, error) {
@@ -81,8 +90,18 @@ func primaryKeyTmpl(seed, applicationParam []byte) tpm2.Public {
 var baseTime = time.Date(2021, time.January, 1, 0, 0, 0, 0, time.UTC)
 
 func (t *TPM) Counter() uint32 {
-	unix := time.Now().Unix()
-	return uint32(unix - baseTime.Unix())
+	wallClock := uint32(time.Now().Unix() - baseTime.Unix())
+
+	for {
+		prev := atomic.LoadUint32(&t.lastCounter)
+		next := wallClock
+		if next <= prev {
+			next = prev + 1
+		}
+		if atomic.CompareAndSwapUint32(&t.lastCounter, prev, next) {
+			return next
+		}
+	}
 }
 
 // Register a new key with the TPM for the given applicationParam.

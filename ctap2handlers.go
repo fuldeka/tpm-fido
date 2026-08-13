@@ -105,6 +105,11 @@ func (s *server) handleMakeCredential(parentCtx context.Context, token *fidohid.
 	// options.uv=true with no param as the "go get a token" case.
 	userVerified := false
 	if len(req.PinUvAuthParam) > 0 {
+		if req.PinUvAuthProtocol != 1 {
+			log.Printf("MakeCredential site=%s: unsupported pinUvAuthProtocol %d", req.RP.ID, req.PinUvAuthProtocol)
+			token.WriteCborResponse(parentCtx, evt, nil, ctap2.StatusInvalidParameter)
+			return
+		}
 		if !s.verifyPinToken(req.ClientDataHash, req.PinUvAuthParam) {
 			log.Printf("MakeCredential site=%s: pinUvAuthParam did not verify", req.RP.ID)
 			token.WriteCborResponse(parentCtx, evt, nil, ctap2.StatusPinAuthInvalid)
@@ -287,6 +292,11 @@ func (s *server) handleGetAssertion(parentCtx context.Context, token *fidohid.So
 	// wrong).
 	userVerified := false
 	if len(req.PinUvAuthParam) > 0 {
+		if req.PinUvAuthProtocol != 1 {
+			log.Printf("GetAssertion site=%s: unsupported pinUvAuthProtocol %d", req.RPID, req.PinUvAuthProtocol)
+			token.WriteCborResponse(parentCtx, evt, nil, ctap2.StatusInvalidParameter)
+			return
+		}
 		if !s.verifyPinToken(req.ClientDataHash, req.PinUvAuthParam) {
 			log.Printf("GetAssertion site=%s: pinUvAuthParam did not verify", req.RPID)
 			token.WriteCborResponse(parentCtx, evt, nil, ctap2.StatusPinAuthInvalid)
@@ -399,6 +409,11 @@ func (s *server) handleCredentialManagement(parentCtx context.Context, token *fi
 	switch req.SubCommand {
 	case ctap2.CredMgmtSubGetCredsMetadata, ctap2.CredMgmtSubEnumerateRPsBegin,
 		ctap2.CredMgmtSubEnumerateCredsBegin, ctap2.CredMgmtSubDeleteCredential:
+		if req.PinUvAuthProtocol != 1 {
+			log.Printf("credentialManagement subcommand 0x%02x: unsupported pinUvAuthProtocol %d", req.SubCommand, req.PinUvAuthProtocol)
+			token.WriteCborResponse(parentCtx, evt, nil, ctap2.StatusInvalidParameter)
+			return
+		}
 		if !s.verifyPinToken(req.AuthenticatedMessage, req.PinUvAuthParam) {
 			log.Printf("credentialManagement subcommand 0x%02x: invalid or missing pinUvAuthParam", req.SubCommand)
 			token.WriteCborResponse(parentCtx, evt, nil, ctap2.StatusOperationDenied)
@@ -417,14 +432,18 @@ func (s *server) handleCredentialManagement(parentCtx context.Context, token *fi
 		token.WriteCborResponse(parentCtx, evt, resp, ctap2.StatusSuccess)
 
 	case ctap2.CredMgmtSubEnumerateRPsBegin:
+		s.credMgmtCursorMu.Lock()
 		s.credMgmtCursor = credMgmtCursor{rpIDs: s.resident.RPIDs()}
 		if len(s.credMgmtCursor.rpIDs) == 0 {
+			s.credMgmtCursorMu.Unlock()
 			token.WriteCborResponse(parentCtx, evt, nil, ctap2.StatusNoCredentials)
 			return
 		}
 		rpID := s.credMgmtCursor.rpIDs[0]
+		total := len(s.credMgmtCursor.rpIDs)
 		s.credMgmtCursor.rpIdx = 1
-		resp, err := ctap2.EncodeEnumerateRPResponse(rpID, len(s.credMgmtCursor.rpIDs), true)
+		s.credMgmtCursorMu.Unlock()
+		resp, err := ctap2.EncodeEnumerateRPResponse(rpID, total, true)
 		if err != nil {
 			log.Printf("EncodeEnumerateRPResponse err: %s", err)
 			token.WriteCborResponse(parentCtx, evt, nil, ctap2.StatusOther)
@@ -433,12 +452,15 @@ func (s *server) handleCredentialManagement(parentCtx context.Context, token *fi
 		token.WriteCborResponse(parentCtx, evt, resp, ctap2.StatusSuccess)
 
 	case ctap2.CredMgmtSubEnumerateRPsGetNextRP:
+		s.credMgmtCursorMu.Lock()
 		if s.credMgmtCursor.rpIdx >= len(s.credMgmtCursor.rpIDs) {
+			s.credMgmtCursorMu.Unlock()
 			token.WriteCborResponse(parentCtx, evt, nil, ctap2.StatusNoCredentials)
 			return
 		}
 		rpID := s.credMgmtCursor.rpIDs[s.credMgmtCursor.rpIdx]
 		s.credMgmtCursor.rpIdx++
+		s.credMgmtCursorMu.Unlock()
 		resp, err := ctap2.EncodeEnumerateRPResponse(rpID, 0, false)
 		if err != nil {
 			log.Printf("EncodeEnumerateRPResponse err: %s", err)
@@ -458,8 +480,10 @@ func (s *server) handleCredentialManagement(parentCtx context.Context, token *fi
 			token.WriteCborResponse(parentCtx, evt, nil, ctap2.StatusNoCredentials)
 			return
 		}
+		s.credMgmtCursorMu.Lock()
 		s.credMgmtCursor.creds = creds
 		s.credMgmtCursor.credIdx = 1
+		s.credMgmtCursorMu.Unlock()
 		resp, err := ctap2.EncodeEnumerateCredentialResponse(creds[0].CredentialID, creds[0].UserID, creds[0].UserName, len(creds), true)
 		if err != nil {
 			log.Printf("EncodeEnumerateCredentialResponse err: %s", err)
@@ -469,12 +493,15 @@ func (s *server) handleCredentialManagement(parentCtx context.Context, token *fi
 		token.WriteCborResponse(parentCtx, evt, resp, ctap2.StatusSuccess)
 
 	case ctap2.CredMgmtSubEnumerateCredsGetNextCred:
+		s.credMgmtCursorMu.Lock()
 		if s.credMgmtCursor.credIdx >= len(s.credMgmtCursor.creds) {
+			s.credMgmtCursorMu.Unlock()
 			token.WriteCborResponse(parentCtx, evt, nil, ctap2.StatusNoCredentials)
 			return
 		}
 		cred := s.credMgmtCursor.creds[s.credMgmtCursor.credIdx]
 		s.credMgmtCursor.credIdx++
+		s.credMgmtCursorMu.Unlock()
 		resp, err := ctap2.EncodeEnumerateCredentialResponse(cred.CredentialID, cred.UserID, cred.UserName, 0, false)
 		if err != nil {
 			log.Printf("EncodeEnumerateCredentialResponse err: %s", err)
@@ -553,6 +580,15 @@ func (s *server) handleClientPIN(parentCtx context.Context, token *fidohid.SoftT
 		log.Printf("decode clientPIN request err: %s", err)
 		token.WriteCborResponse(parentCtx, evt, nil, ctap2.StatusOther)
 		return
+	}
+
+	switch req.SubCommand {
+	case ctap2.ClientPINSubSetPIN, ctap2.ClientPINSubChangePIN, ctap2.ClientPINSubGetPINToken:
+		if req.PinUvAuthProtocol != 1 {
+			log.Printf("clientPIN subcommand 0x%02x: unsupported pinUvAuthProtocol %d", req.SubCommand, req.PinUvAuthProtocol)
+			token.WriteCborResponse(parentCtx, evt, nil, ctap2.StatusInvalidParameter)
+			return
+		}
 	}
 
 	switch req.SubCommand {

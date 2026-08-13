@@ -7,13 +7,16 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"math/big"
+	"sync"
 
 	"golang.org/x/crypto/chacha20poly1305"
 )
 
 type Mem struct {
 	masterPrivateKey []byte
-	signCounter      uint32
+
+	mu          sync.Mutex
+	signCounter uint32
 }
 
 func New() (*Mem, error) {
@@ -23,6 +26,8 @@ func New() (*Mem, error) {
 }
 
 func (m *Mem) Counter() uint32 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.signCounter++
 	return m.signCounter
 }

@@ -24,12 +24,12 @@ type Pinentry struct {
 
 type request struct {
 	timeout       time.Duration
-	pendingResult chan Result
 	extendTimeout chan time.Duration
 	done          chan struct{}
 
-	mu     sync.Mutex
-	cancel context.CancelFunc
+	mu      sync.Mutex
+	cancel  context.CancelFunc
+	waiters []chan Result
 
 	challengeParam   [32]byte
 	applicationParam [32]byte
@@ -58,7 +58,8 @@ func (pe *Pinentry) ConfirmPresence(callerCtx context.Context, prompt string, ch
 			return nil, errors.New("other request already in progress")
 		}
 
-		extendTimeoutChan := pe.activeRequest.extendTimeout
+		req := pe.activeRequest
+		extendTimeoutChan := req.extendTimeout
 
 		go func() {
 			select {
@@ -67,36 +68,64 @@ func (pe *Pinentry) ConfirmPresence(callerCtx context.Context, prompt string, ch
 			}
 		}()
 
-		go watchCancel(callerCtx, pe.activeRequest)
+		resultChan := make(chan Result, 1)
+		req.mu.Lock()
+		req.waiters = append(req.waiters, resultChan)
+		req.mu.Unlock()
 
-		return pe.activeRequest.pendingResult, nil
+		go watchCancel(callerCtx, req, resultChan)
+
+		return resultChan, nil
 	}
 
 	req := &request{
 		timeout:          timeout,
 		challengeParam:   challengeParam,
 		applicationParam: applicationParam,
-		pendingResult:    make(chan Result),
 		extendTimeout:    make(chan time.Duration),
 		done:             make(chan struct{}),
 	}
 	pe.activeRequest = req
 
-	go pe.prompt(req, prompt)
-	go watchCancel(callerCtx, req)
+	resultChan := make(chan Result, 1)
+	req.waiters = append(req.waiters, resultChan)
 
-	return req.pendingResult, nil
+	go pe.prompt(req, prompt)
+	go watchCancel(callerCtx, req, resultChan)
+
+	return resultChan, nil
 }
 
-// watchCancel kills req's pinentry subprocess if callerCtx is canceled
-// before the request resolves on its own (result delivered or timed out).
-func watchCancel(callerCtx context.Context, req *request) {
+// watchCancel resolves resultChan with a canceled/denied result if callerCtx
+// is canceled before the request resolves on its own (result delivered or
+// timed out). Only the caller that owns resultChan is affected -- other
+// callers coalesced onto the same underlying pinentry prompt keep waiting.
+// The shared pinentry subprocess itself is only killed once every waiter has
+// been canceled, so one caller's CTAPHID_CANCEL never yanks the dialog out
+// from under a still-live sibling request.
+func watchCancel(callerCtx context.Context, req *request, resultChan chan Result) {
 	select {
 	case <-callerCtx.Done():
 		req.mu.Lock()
+		allCanceled := true
+		for i, w := range req.waiters {
+			if w == resultChan {
+				req.waiters = append(req.waiters[:i], req.waiters[i+1:]...)
+				break
+			}
+		}
+		if len(req.waiters) > 0 {
+			allCanceled = false
+		}
 		cancel := req.cancel
 		req.mu.Unlock()
-		if cancel != nil {
+
+		select {
+		case resultChan <- Result{OK: false, Error: errors.New("canceled")}:
+		default:
+		}
+
+		if allCanceled && cancel != nil {
 			cancel()
 		}
 	case <-req.done:
@@ -105,12 +134,18 @@ func watchCancel(callerCtx context.Context, req *request) {
 
 func (pe *Pinentry) prompt(req *request, prompt string) {
 	sendResult := func(r Result) {
-		select {
-		case req.pendingResult <- r:
-		case <-time.After(req.timeout):
-			// we expect requests to come in every ~750ms.
-			// If we've been waiting for 2 seconds the client
-			// is likely gone.
+		req.mu.Lock()
+		waiters := req.waiters
+		req.waiters = nil
+		req.mu.Unlock()
+
+		for _, w := range waiters {
+			// buffered (cap 1) so this never blocks; a waiter that already
+			// got a canceled result via watchCancel just drops the send.
+			select {
+			case w <- r:
+			default:
+			}
 		}
 
 		close(req.done)

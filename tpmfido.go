@@ -51,9 +51,11 @@ type server struct {
 	// credMgmtCursor holds pagination state for the CTAP2 credential
 	// management enumerateRPs/enumerateCredentials GetNext* calls, which
 	// are stateful across a sequence of CTAPHID requests on the same
-	// channel. Single global cursor is fine: CTAP2 clients don't
-	// interleave separate enumeration sessions.
-	credMgmtCursor credMgmtCursor
+	// channel. Each HID event is handled on its own goroutine (see
+	// run()), so credMgmtCursorMu guards against concurrent enumeration
+	// sessions racing on this single global cursor.
+	credMgmtCursorMu sync.Mutex
+	credMgmtCursor   credMgmtCursor
 
 	// keyAgreement is this authenticator's ECDH keypair for CTAP2 PIN/UV
 	// Auth Protocol One. Generated once at process start and reused for
