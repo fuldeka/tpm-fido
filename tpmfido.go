@@ -27,6 +27,9 @@ import (
 	"github.com/psanford/tpm-fido/sitesignatures"
 	"github.com/psanford/tpm-fido/statuscode"
 	"github.com/psanford/tpm-fido/tpm"
+	"github.com/psanford/tpm-fido/uvconfig"
+	"github.com/psanford/tpm-fido/uvmethod"
+	"github.com/psanford/tpm-fido/uvmethod/pinverifier"
 )
 
 var backend = flag.String("backend", "tpm", "tpm|memory")
@@ -34,6 +37,7 @@ var device = flag.String("device", "/dev/tpmrm0", "TPM device path")
 var residentStorePath = flag.String("resident-store", "", "path to resident (discoverable) credential metadata store; defaults to $XDG_CONFIG_HOME/tpm-fido/resident-credentials.json")
 var pinStorePath = flag.String("pin-store", "", "path to PIN hash/retry-counter store; defaults to $XDG_CONFIG_HOME/tpm-fido/pin-state.json")
 var ctlSocketPath = flag.String("ctl-socket", "", "path to the local control-socket used by companion tools (e.g. a tray app); defaults to $XDG_RUNTIME_DIR/tpm-fido.sock")
+var uvConfigPath = flag.String("uv-config", "", "path to the user-toggle store (internal-UV/Hello mode); defaults to $XDG_CONFIG_HOME/tpm-fido/uv-config.json")
 var noTray = flag.Bool("no-tray", false, "don't launch the tpm-fido-tray companion UI (it's launched by default once tpm-fido-tray is found on PATH)")
 
 func main() {
@@ -47,6 +51,15 @@ type server struct {
 	signer   Signer
 	resident *residentstore.Store
 	pins     *pinstore.Store
+
+	// uvcfg holds user toggles, notably internal-UV ("Hello mode"). Read on
+	// every getInfo so the tray can flip it live.
+	uvcfg *uvconfig.Store
+
+	// uvVerifier performs built-in user verification for the CTAP 2.1
+	// internal-UV (getUvToken) path. PIN-backed today; the interface lets a
+	// biometric backend replace it later without touching the CTAP2 layer.
+	uvVerifier uvmethod.Verifier
 
 	// credMgmtCursor holds pagination state for the CTAP2 credential
 	// management enumerateRPs/enumerateCredentials GetNext* calls, which
@@ -145,6 +158,14 @@ func newServer() *server {
 		panic(err)
 	}
 	s.keyAgreement = ka
+
+	uvcfg, err := uvconfig.Open(*uvConfigPath)
+	if err != nil {
+		panic(err)
+	}
+	s.uvcfg = uvcfg
+
+	s.uvVerifier = pinverifier.New(s.pe, s.pins)
 
 	return &s
 }

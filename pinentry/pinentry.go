@@ -38,6 +38,10 @@ type request struct {
 type Result struct {
 	OK    bool
 	Error error
+	// PIN carries the entered PIN for CollectPIN requests. Empty for
+	// ConfirmPresence (which only confirms presence, never collects a
+	// secret). Callers must zero it after use.
+	PIN string
 }
 
 // ConfirmPresence prompts the user via pinentry and returns a channel that
@@ -129,6 +133,113 @@ func watchCancel(callerCtx context.Context, req *request, resultChan chan Result
 			cancel()
 		}
 	case <-req.done:
+	}
+}
+
+// CollectPIN shows a pinentry password dialog (text entry, not a bare
+// confirm) and returns the entered PIN via the result channel. It is used by
+// the CTAP 2.1 internal-UV path (getUvToken): unlike ConfirmPresence, it
+// collects a secret rather than confirming presence, so it never coalesces
+// with other requests -- each getUvToken gets its own fresh dialog. The
+// caller must zero Result.PIN after use.
+//
+// desc is shown in the dialog body; if callerCtx is canceled before the user
+// responds, the dialog is torn down and the result resolves to OK:false.
+func (pe *Pinentry) CollectPIN(callerCtx context.Context, desc string) (chan Result, error) {
+	pe.mu.Lock()
+	defer pe.mu.Unlock()
+
+	if pe.activeRequest != nil {
+		return nil, errors.New("other request already in progress")
+	}
+
+	req := &request{
+		// A human typing a PIN needs more than the 2s presence-tap window.
+		timeout:       60 * time.Second,
+		extendTimeout: make(chan time.Duration),
+		done:          make(chan struct{}),
+	}
+	pe.activeRequest = req
+
+	resultChan := make(chan Result, 1)
+	req.waiters = append(req.waiters, resultChan)
+
+	go pe.promptPIN(req, desc)
+	go watchCancel(callerCtx, req, resultChan)
+
+	return resultChan, nil
+}
+
+func (pe *Pinentry) promptPIN(req *request, desc string) {
+	sendResult := func(r Result) {
+		req.mu.Lock()
+		waiters := req.waiters
+		req.waiters = nil
+		req.mu.Unlock()
+
+		for _, w := range waiters {
+			select {
+			case w <- r:
+			default:
+			}
+		}
+
+		close(req.done)
+
+		pe.mu.Lock()
+		pe.activeRequest = nil
+		pe.mu.Unlock()
+	}
+
+	childCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	req.mu.Lock()
+	req.cancel = cancel
+	req.mu.Unlock()
+
+	p, cmd, err := launchPinEntry(childCtx)
+	if err != nil {
+		sendResult(Result{OK: false, Error: fmt.Errorf("failed to start pinentry: %w", err)})
+		return
+	}
+	defer func() {
+		cancel()
+		cmd.Wait()
+	}()
+
+	defer p.Shutdown()
+	p.SetTitle("TPM-FIDO")
+	p.SetPrompt("PIN")
+	p.SetDesc(desc)
+
+	type pinResult struct {
+		pin string
+		ok  bool
+	}
+	promptResult := make(chan pinResult, 1)
+
+	go func() {
+		pin, err := p.GetPIN()
+		promptResult <- pinResult{pin: pin, ok: err == nil}
+	}()
+
+	timer := time.NewTimer(req.timeout)
+
+	for {
+		select {
+		case r := <-promptResult:
+			sendResult(Result{OK: r.ok, PIN: r.pin})
+			return
+		case <-timer.C:
+			sendResult(Result{OK: false, Error: errors.New("request timed out")})
+			return
+		case d := <-req.extendTimeout:
+			if !timer.Stop() {
+				<-timer.C
+			}
+			timer.Reset(d)
+		}
 	}
 }
 

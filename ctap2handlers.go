@@ -14,6 +14,7 @@ import (
 	"github.com/psanford/tpm-fido/fidohid"
 	"github.com/psanford/tpm-fido/pinprotocol"
 	"github.com/psanford/tpm-fido/residentstore"
+	"github.com/psanford/tpm-fido/uvmethod"
 )
 
 func (s *server) handleCbor(parentCtx context.Context, token *fidohid.SoftToken, evt fidohid.AuthEvent) {
@@ -30,8 +31,9 @@ func (s *server) handleCbor(parentCtx context.Context, token *fidohid.SoftToken,
 
 	switch cmd {
 	case ctap2.CmdGetInfo:
-		log.Printf("got CTAP2 authenticatorGetInfo")
-		resp, err := ctap2.EncodeGetInfoResponse(s.pins.IsSet())
+		internalUV := s.uvcfg.InternalUV()
+		log.Printf("got CTAP2 authenticatorGetInfo (internalUV=%t)", internalUV)
+		resp, err := ctap2.EncodeGetInfoResponse(s.pins.IsSet(), internalUV)
 		if err != nil {
 			log.Printf("encode getInfo response err: %s", err)
 			token.WriteCborResponse(parentCtx, evt, nil, ctap2.StatusOther)
@@ -620,6 +622,18 @@ func (s *server) handleClientPIN(parentCtx context.Context, token *fidohid.SoftT
 	case ctap2.ClientPINSubGetPINToken:
 		s.handleGetPINToken(parentCtx, token, evt, req)
 
+	case ctap2.ClientPINSubGetUVRetries:
+		resp, err := ctap2.EncodeClientPINUVRetriesResponse(s.pins.RetriesLeft())
+		if err != nil {
+			log.Printf("EncodeClientPINUVRetriesResponse err: %s", err)
+			token.WriteCborResponse(parentCtx, evt, nil, ctap2.StatusOther)
+			return
+		}
+		token.WriteCborResponse(parentCtx, evt, resp, ctap2.StatusSuccess)
+
+	case ctap2.ClientPINSubGetUvToken:
+		s.handleGetUvToken(parentCtx, token, evt, req)
+
 	default:
 		log.Printf("unsupported clientPIN subcommand: 0x%02x", req.SubCommand)
 		token.WriteCborResponse(parentCtx, evt, nil, ctap2.StatusUnsupportedOption)
@@ -773,6 +787,83 @@ func (s *server) handleGetPINToken(parentCtx context.Context, token *fidohid.Sof
 	}
 
 	log.Printf("issued pinUvAuthToken")
+	token.WriteCborResponse(parentCtx, evt, resp, ctap2.StatusSuccess)
+}
+
+// handleGetUvToken implements CTAP 2.1
+// getPinUvAuthTokenUsingUvWithPermissions (subcommand 0x06): the
+// Windows-Hello-style path. Instead of the platform sending us a
+// browser-collected pinHashEnc, WE perform built-in user verification on our
+// own side (via s.uvVerifier -- a system PIN dialog today, potentially
+// biometrics later) and, on success, mint a UV-backed pinUvAuthToken. The
+// browser never shows a PIN box.
+//
+// This is only reachable when getInfo advertised uv:true, which is gated on
+// the internal-UV toggle plus a PIN being set; we re-check the toggle here as
+// defense-in-depth in case it was flipped off between getInfo and this call.
+func (s *server) handleGetUvToken(parentCtx context.Context, token *fidohid.SoftToken, evt fidohid.AuthEvent, req *ctap2.ClientPINRequest) {
+	if !s.uvcfg.InternalUV() || !s.pins.IsSet() {
+		log.Printf("getUvToken refused: internal UV not enabled")
+		token.WriteCborResponse(parentCtx, evt, nil, ctap2.StatusUnsupportedOption)
+		return
+	}
+
+	sharedSecret, err := s.keyAgreement.SharedSecret(req.PeerKeyX, req.PeerKeyY)
+	if err != nil {
+		log.Printf("SharedSecret err: %s", err)
+		token.WriteCborResponse(parentCtx, evt, nil, ctap2.StatusOther)
+		return
+	}
+
+	// Built-in user verification (our own system prompt). This blocks on the
+	// user; parentCtx cancellation (CTAPHID_CANCEL) aborts it.
+	outcome, err := s.uvVerifier.Verify(parentCtx, req.RpID)
+	if err != nil {
+		log.Printf("getUvToken: uv method %q error: %s", s.uvVerifier.Name(), err)
+		token.WriteCborResponse(parentCtx, evt, nil, ctap2.StatusOther)
+		return
+	}
+
+	switch outcome {
+	case uvmethod.Verified:
+		// fall through to mint the token
+	case uvmethod.LockedOut:
+		log.Printf("getUvToken: uv method %q locked out", s.uvVerifier.Name())
+		token.WriteCborResponse(parentCtx, evt, nil, ctap2.StatusPinBlocked)
+		return
+	case uvmethod.Unavailable:
+		log.Printf("getUvToken: uv method %q unavailable", s.uvVerifier.Name())
+		token.WriteCborResponse(parentCtx, evt, nil, ctap2.StatusUnsupportedOption)
+		return
+	default: // Rejected
+		log.Printf("getUvToken: user verification declined/failed")
+		token.WriteCborResponse(parentCtx, evt, nil, ctap2.StatusOperationDenied)
+		return
+	}
+
+	uvToken := make([]byte, 32)
+	if _, err := rand.Read(uvToken); err != nil {
+		log.Printf("generate uvToken err: %s", err)
+		token.WriteCborResponse(parentCtx, evt, nil, ctap2.StatusOther)
+		return
+	}
+	s.setPinToken(uvToken)
+
+	encryptedToken, err := pinprotocol.Encrypt(sharedSecret, uvToken)
+	if err != nil {
+		log.Printf("encrypt uvToken err: %s", err)
+		token.WriteCborResponse(parentCtx, evt, nil, ctap2.StatusOther)
+		return
+	}
+
+	resp, err := ctap2.EncodeClientPINTokenResponse(encryptedToken)
+	if err != nil {
+		log.Printf("EncodeClientPINTokenResponse err: %s", err)
+		token.WriteCborResponse(parentCtx, evt, nil, ctap2.StatusOther)
+		return
+	}
+
+	log.Printf("issued UV-backed pinUvAuthToken (no browser PIN box)")
 	token.WriteCborResponse(parentCtx, evt, resp, ctap2.StatusSuccess)
 }
 

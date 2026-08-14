@@ -58,6 +58,7 @@ const (
 	StatusNoCredentials      byte = 0x2E
 	StatusOperationDenied    byte = 0x27
 	StatusUnsupportedOption  byte = 0x2C
+	StatusPinBlocked         byte = 0x32 // PIN/UV retries exhausted; authenticator locked out
 	StatusPinAuthInvalid     byte = 0x33 // pinUvAuthParam was supplied but did not verify
 	StatusPinRequired        byte = 0x36 // pinUvAuthParam was required but not supplied at all
 	StatusOther              byte = 0x7F
@@ -84,27 +85,40 @@ type getInfoResponse struct {
 // notably libfido2, gate credential-management access on this being true,
 // so it must track real PIN state rather than being hardcoded).
 //
-// The "uv" option is deliberately omitted (rather than set true): per
-// CTAP2 spec, "uv" means the authenticator has a *built-in* user
-// verification method (fingerprint, face, on-device PIN pad) that it can
-// satisfy without any pinUvAuthParam round-trip. This authenticator has no
-// such thing -- its only UV mechanism is PIN-via-platform, which is
-// already correctly signaled by clientPin/pinUvAuthProtocols. Advertising
-// uv:true here previously made at least Chrome behave as though built-in
-// UV should be attempted instead of the PIN protocol, so it never issued
-// a getKeyAgreement/getPINToken request at all and just retried
-// MakeCredential in a loop, always failing PIN_REQUIRED.
-func EncodeGetInfoResponse(clientPinSet bool) ([]byte, error) {
+// The "uv" option (built-in user verification, a la Windows Hello / Touch
+// ID) is gated on internalUV. Per CTAP2 spec, uv:true means the authenticator
+// can verify the user on its *own* side without the platform sending a
+// pinUvAuthParam derived from a browser-collected PIN. When internalUV is on
+// (and a PIN exists to back it) we advertise uv:true + pinUvAuthToken +
+// FIDO_2_1, and browsers drive getPinUvAuthTokenUsingUvWithPermissions so we
+// collect the PIN in our own system dialog -- no browser PIN box. When it's
+// off we behave as a plain clientPIN authenticator (the browser collects the
+// PIN). Advertising uv:true is only safe alongside the getUvToken/
+// getUVRetries handlers; historically advertising it *without* them made
+// Chrome loop on MakeCredential forever, always failing PIN_REQUIRED.
+func EncodeGetInfoResponse(clientPinSet, internalUV bool) ([]byte, error) {
+	// Internal UV needs a PIN to actually verify against, so only light it up
+	// when a PIN is set.
+	helloMode := internalUV && clientPinSet
+
+	versions := []string{"U2F_V2", "FIDO_2_0"}
+	options := map[string]bool{
+		"rk":        true,
+		"up":        true,
+		"plat":      false,
+		"clientPin": clientPinSet,
+		"credMgmt":  true,
+	}
+	if helloMode {
+		versions = append(versions, "FIDO_2_1")
+		options["uv"] = true
+		options["pinUvAuthToken"] = true
+	}
+
 	resp := getInfoResponse{
-		Versions: []string{"U2F_V2", "FIDO_2_0"},
-		AAGUID:   AAGUID[:],
-		Options: map[string]bool{
-			"rk":        true,
-			"up":        true,
-			"plat":      false,
-			"clientPin": clientPinSet,
-			"credMgmt":  true,
-		},
+		Versions:           versions,
+		AAGUID:             AAGUID[:],
+		Options:            options,
 		PinUvAuthProtocols: []int{1},
 	}
 	return ctap2EncMode.Marshal(resp)
@@ -518,6 +532,17 @@ const (
 	ClientPINSubSetPIN          = 0x03
 	ClientPINSubChangePIN       = 0x04
 	ClientPINSubGetPINToken     = 0x05
+	// ClientPINSubGetUvToken (getPinUvAuthTokenUsingUvWithPermissions) is the
+	// CTAP 2.1 internal-UV token request: the browser asks us to mint a
+	// UV-backed pinUvAuthToken and we perform user verification on our own
+	// side (a system PIN dialog) instead of receiving a browser-collected
+	// pinHashEnc. Only meaningful when getInfo advertised uv:true.
+	ClientPINSubGetUvToken = 0x06
+	// ClientPINSubGetUVRetries (getUVRetries) reports remaining built-in-UV
+	// attempts. Chrome calls this before getUvToken to decide whether
+	// internal UV is usable; if we reject it, Chrome abandons the
+	// authenticator and falls back to other transports.
+	ClientPINSubGetUVRetries = 0x07
 )
 
 type coseKeyPub struct {
@@ -535,6 +560,9 @@ type clientPINCbor struct {
 	PinUvAuthParam    []byte     `cbor:"4,keyasint"`
 	NewPinEnc         []byte     `cbor:"5,keyasint"`
 	PinHashEnc        []byte     `cbor:"6,keyasint"`
+	// CTAP 2.1 permission-scoped token fields (used by getUvToken).
+	Permissions int    `cbor:"9,keyasint,omitempty"`
+	RpID        string `cbor:"10,keyasint,omitempty"`
 }
 
 // ClientPINRequest is the decoded subset of an authenticatorClientPIN
@@ -547,6 +575,8 @@ type ClientPINRequest struct {
 	PinUvAuthParam    []byte
 	NewPinEnc         []byte
 	PinHashEnc        []byte
+	Permissions       int
+	RpID              string
 }
 
 func DecodeClientPINRequest(body []byte) (*ClientPINRequest, error) {
@@ -563,6 +593,8 @@ func DecodeClientPINRequest(body []byte) (*ClientPINRequest, error) {
 		PinUvAuthParam:    req.PinUvAuthParam,
 		NewPinEnc:         req.NewPinEnc,
 		PinHashEnc:        req.PinHashEnc,
+		Permissions:       req.Permissions,
+		RpID:              req.RpID,
 	}, nil
 }
 
@@ -603,5 +635,19 @@ type clientPINGetRetriesResponse struct {
 // protocol at all.
 func EncodeClientPINRetriesResponse(retriesLeft int) ([]byte, error) {
 	resp := clientPINGetRetriesResponse{PinRetries: retriesLeft}
+	return ctap2EncMode.Marshal(resp)
+}
+
+type clientPINGetUVRetriesResponse struct {
+	UVRetries int `cbor:"5,keyasint"`
+}
+
+// EncodeClientPINUVRetriesResponse builds the response for the getUVRetries
+// subcommand (0x07). Chrome calls this before getUvToken to decide whether
+// built-in UV is usable; rejecting it makes Chrome abandon the authenticator
+// and fall back to other transports. Our built-in UV is PIN-backed, so we
+// mirror the PIN retry counter.
+func EncodeClientPINUVRetriesResponse(retriesLeft int) ([]byte, error) {
+	resp := clientPINGetUVRetriesResponse{UVRetries: retriesLeft}
 	return ctap2EncMode.Marshal(resp)
 }

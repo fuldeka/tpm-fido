@@ -8,6 +8,7 @@ package main
 
 import (
 	_ "embed"
+	"encoding/json"
 	"fmt"
 	"log"
 
@@ -31,7 +32,19 @@ func onTrayReady() {
 
 	openItem := systray.AddMenuItem("Open tpm-fido Manager", "View PIN status and credentials")
 	systray.AddSeparator()
+	helloItem := systray.AddMenuItemCheckbox("Windows Hello mode",
+		"Verify with tpm-fido's own PIN prompt instead of the browser's PIN box", true)
+	systray.AddSeparator()
 	quitItem := systray.AddMenuItem("Quit", "Quit tpm-fido-tray")
+
+	// Reflect the daemon's persisted toggle state into the checkbox. If the
+	// daemon isn't reachable yet, leave the optimistic default (checked) and
+	// let the first click reconcile.
+	if enabled, err := getInternalUV(); err == nil {
+		setCheck(helloItem, enabled)
+	} else {
+		log.Printf("could not read internal-UV state: %s", err)
+	}
 
 	// GTK owns its own event loop (gtk.Main) once initialized, but that
 	// only needs to happen on some goroutine -- unlike systray, which
@@ -41,6 +54,37 @@ func onTrayReady() {
 	// GTK setup lazily here (rather than in main) keeps the tray icon
 	// responsive even before the window is ever opened.
 	go runGTK(openItem, quitItem)
+	go watchHelloToggle(helloItem)
+}
+
+// watchHelloToggle handles clicks on the "Windows Hello mode" checkbox: it
+// toggles the daemon's persisted internal-UV setting and reconciles the
+// checkbox to whatever the daemon actually stored (so a failed call doesn't
+// leave the UI lying about the real state).
+func watchHelloToggle(item *systray.MenuItem) {
+	for range item.ClickedCh {
+		// The checkbox's visual state has already flipped on click; derive
+		// the intended target from it.
+		want := !item.Checked()
+		enabled, err := setInternalUV(want)
+		if err != nil {
+			log.Printf("set internal-UV failed: %s", err)
+			// Reconcile to the last known-good value from the daemon.
+			if cur, gerr := getInternalUV(); gerr == nil {
+				setCheck(item, cur)
+			}
+			continue
+		}
+		setCheck(item, enabled)
+	}
+}
+
+func setCheck(item *systray.MenuItem, on bool) {
+	if on {
+		item.Check()
+	} else {
+		item.Uncheck()
+	}
 }
 
 func onTrayExit() {}
@@ -96,4 +140,34 @@ func call(method string, params interface{}) (*ctlsocket.Response, error) {
 		return nil, err
 	}
 	return resp, nil
+}
+
+// getInternalUV reads the daemon's persisted "Windows Hello mode" toggle.
+func getInternalUV() (bool, error) {
+	resp, err := call("GetInternalUV", nil)
+	if err != nil {
+		return false, err
+	}
+	var r struct {
+		Enabled bool `json:"enabled"`
+	}
+	if err := json.Unmarshal(resp.Result, &r); err != nil {
+		return false, err
+	}
+	return r.Enabled, nil
+}
+
+// setInternalUV writes the toggle and returns the value the daemon stored.
+func setInternalUV(enabled bool) (bool, error) {
+	resp, err := call("SetInternalUV", map[string]bool{"enabled": enabled})
+	if err != nil {
+		return false, err
+	}
+	var r struct {
+		Enabled bool `json:"enabled"`
+	}
+	if err := json.Unmarshal(resp.Result, &r); err != nil {
+		return false, err
+	}
+	return r.Enabled, nil
 }

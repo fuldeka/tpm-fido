@@ -292,6 +292,105 @@ func TestEncodeClientPINRetriesResponse(t *testing.T) {
 	}
 }
 
+func TestEncodeClientPINUVRetriesResponse(t *testing.T) {
+	body, err := EncodeClientPINUVRetriesResponse(7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded struct {
+		UVRetries int `cbor:"5,keyasint"`
+	}
+	if err := cbor.Unmarshal(body, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.UVRetries != 7 {
+		t.Fatalf("expected uvRetries=7, got %d", decoded.UVRetries)
+	}
+}
+
+// getInfoOptions decodes just the options map + versions from a getInfo
+// response so we can assert what's advertised.
+func decodeGetInfo(t *testing.T, body []byte) (map[string]bool, []string) {
+	t.Helper()
+	var decoded struct {
+		Versions []string        `cbor:"1,keyasint"`
+		Options  map[string]bool `cbor:"4,keyasint"`
+	}
+	if err := cbor.Unmarshal(body, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	return decoded.Options, decoded.Versions
+}
+
+func hasVersion(vs []string, want string) bool {
+	for _, v := range vs {
+		if v == want {
+			return true
+		}
+	}
+	return false
+}
+
+func TestEncodeGetInfoInternalUVGating(t *testing.T) {
+	// Hello mode requires BOTH the toggle on AND a PIN set.
+	cases := []struct {
+		name              string
+		pinSet, internal  bool
+		wantUV, want2_1   bool
+	}{
+		{"no-pin-toggle-off", false, false, false, false},
+		{"no-pin-toggle-on", false, true, false, false},
+		{"pin-toggle-off", true, false, false, false},
+		{"pin-toggle-on", true, true, true, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			body, err := EncodeGetInfoResponse(tc.pinSet, tc.internal)
+			if err != nil {
+				t.Fatal(err)
+			}
+			opts, versions := decodeGetInfo(t, body)
+
+			if got := opts["uv"]; got != tc.wantUV {
+				t.Errorf("uv=%t, want %t", got, tc.wantUV)
+			}
+			if got := opts["pinUvAuthToken"]; got != tc.wantUV {
+				t.Errorf("pinUvAuthToken=%t, want %t", got, tc.wantUV)
+			}
+			if got := hasVersion(versions, "FIDO_2_1"); got != tc.want2_1 {
+				t.Errorf("FIDO_2_1 advertised=%t, want %t", got, tc.want2_1)
+			}
+			// clientPin option always tracks the PIN-set state regardless.
+			if got := opts["clientPin"]; got != tc.pinSet {
+				t.Errorf("clientPin=%t, want %t", got, tc.pinSet)
+			}
+		})
+	}
+}
+
+func TestDecodeClientPINRequestPermissionsAndRpID(t *testing.T) {
+	req := clientPINCbor{
+		PinUvAuthProtocol: 1,
+		SubCommand:        ClientPINSubGetUvToken,
+		Permissions:       0x01,
+		RpID:              "example.com",
+	}
+	body, err := cbor.Marshal(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := DecodeClientPINRequest(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decoded.Permissions != 0x01 {
+		t.Errorf("permissions=%d, want 1", decoded.Permissions)
+	}
+	if decoded.RpID != "example.com" {
+		t.Errorf("rpID=%q, want example.com", decoded.RpID)
+	}
+}
+
 func TestDecodeGetAssertionRequestValidation(t *testing.T) {
 	if _, err := DecodeGetAssertionRequest([]byte{0xA0}); err == nil {
 		t.Fatal("expected error for missing rpId")

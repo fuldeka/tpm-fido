@@ -28,7 +28,18 @@ const (
 	MethodPINStatus  = "PINStatus"
 	MethodSetPIN     = "SetPIN"
 	MethodChangePIN  = "ChangePIN"
+	// Internal-UV ("Hello mode") toggle.
+	MethodGetInternalUV = "GetInternalUV"
+	MethodSetInternalUV = "SetInternalUV"
 )
+
+type internalUVResult struct {
+	Enabled bool `json:"enabled"`
+}
+
+type setInternalUVParams struct {
+	Enabled bool `json:"enabled"`
+}
 
 type CredentialInfo struct {
 	CredentialID string `json:"credential_id"` // base64
@@ -144,6 +155,19 @@ func (s *server) handleCtlRequest(method string, params json.RawMessage) (interf
 		// PIN change, same as the ClientPIN changePIN subcommand.
 		s.setPinToken(nil)
 		return struct{}{}, nil
+
+	case MethodGetInternalUV:
+		return internalUVResult{Enabled: s.uvcfg.InternalUV()}, nil
+
+	case MethodSetInternalUV:
+		var p setInternalUVParams
+		if err := json.Unmarshal(params, &p); err != nil {
+			return nil, fmt.Errorf("invalid params: %w", err)
+		}
+		if err := s.uvcfg.SetInternalUV(p.Enabled); err != nil {
+			return nil, err
+		}
+		return internalUVResult{Enabled: p.Enabled}, nil
 
 	default:
 		return nil, fmt.Errorf("unknown method: %s", method)
