@@ -14,9 +14,15 @@ On an authentication request, tpm-fido will attempt to load the primary key by i
 
 ## CTAP2 / resident (discoverable) credentials
 
-tpm-fido also implements a subset of CTAP2 over the same HID transport: `authenticatorGetInfo`, `authenticatorMakeCredential`, `authenticatorGetAssertion`, `authenticatorClientPIN` (PIN/UV Auth Protocol One: getKeyAgreement, setPIN, changePIN, getPINToken), and a read/delete subset of `authenticatorCredentialManagement` (getCredsMetadata, enumerateRPs, enumerateCredentials, deleteCredential). This is what lets tpm-fido register as a **resident/discoverable key** ("passkey") with PIN-based user verification, which sites like GitHub require — the original U2F-only implementation cannot satisfy that requirement, since resident keys and PIN-based UV are CTAP2-only concepts with no equivalent in the U2F protocol.
+tpm-fido also implements a subset of CTAP2 over the same HID transport: `authenticatorGetInfo`, `authenticatorMakeCredential`, `authenticatorGetAssertion`, `authenticatorClientPIN` (PIN/UV Auth Protocol One: getKeyAgreement, setPIN, changePIN, getPINToken, getPinUvAuthTokenUsingUvWithPermissions, getPINRetries, getUVRetries), and a read/delete subset of `authenticatorCredentialManagement` (getCredsMetadata, enumerateRPs, enumerateCredentials, deleteCredential). This is what lets tpm-fido register as a **resident/discoverable key** ("passkey") with PIN-based user verification, which sites like GitHub require — the original U2F-only implementation cannot satisfy that requirement, since resident keys and PIN-based UV are CTAP2-only concepts with no equivalent in the U2F protocol.
 
 Discoverable credential metadata (rpId, user id/name, credential id, a per-credential sign counter) is persisted to `$XDG_CONFIG_HOME/tpm-fido/resident-credentials.json` (override with `-resident-store <path>`). The PIN's hash and retry counter are persisted to `$XDG_CONFIG_HOME/tpm-fido/pin-state.json` (override with `-pin-store <path>`) — the PIN itself is never stored, only left-16-bytes-of-SHA-256(PIN). Only metadata needed to locate and re-derive a credential is stored there; the private key material stays TPM-sealed inside the credential's own key handle exactly as in the U2F flow, so a leaked store file alone does not expose signing keys when using the `tpm` backend.
+
+### Windows Hello mode (internal user verification)
+
+By default, tpm-fido advertises CTAP 2.1 built-in user verification (`uv:true` + `pinUvAuthToken`, alongside `FIDO_2_1`) whenever a PIN is set. In this mode the browser shows **no PIN box**: it drives `getPinUvAuthTokenUsingUvWithPermissions` and tpm-fido collects the PIN in its own `pinentry` system dialog, verifying it against the same `pin-state.json` hash used by the browser-collected PIN path. This is the Windows-Hello / Touch-ID interaction model — the PIN prompt belongs to the authenticator, not the web page. Credentials are mode-agnostic: one registered while this mode was off (browser-collected PIN) authenticates unchanged while it's on, and vice versa.
+
+The mode is a persisted, per-user toggle (`$XDG_CONFIG_HOME/tpm-fido/uv-config.json`, override with `-uv-config <path>`), **on by default**, flipped live from the `tpm-fido-tray` menu ("Windows Hello mode") — no restart needed. Turn it off to fall back to plain clientPIN behaviour (the browser collects the PIN) if a browser update ever regresses internal UV over HID. The built-in UV backend is PIN-based today, but is structured behind an interface so a biometric backend could replace it without touching the CTAP2 layer.
 
 Non-resident (classic allowList-based) WebAuthn and legacy U2F both continue to work unchanged and require no local state.
 
@@ -28,7 +34,7 @@ Known limitations of the CTAP2 support:
 
 ## tpm-fido-tray
 
-`tpm-fido-tray` is an optional companion GUI: a system tray icon for setting/changing the PIN and viewing/deleting resident credentials, without needing a CLI tool or relying on a browser's own (often absent) PIN-setup UI. It talks to the running `tpm-fido` daemon over a local Unix control socket (`$XDG_RUNTIME_DIR/tpm-fido.sock` by default) — it never touches the TPM, HID device, or on-disk stores directly.
+`tpm-fido-tray` is an optional companion GUI: a system tray icon for setting/changing the PIN, viewing/deleting resident credentials, and toggling Windows Hello mode (the "Windows Hello mode" menu checkbox), without needing a CLI tool or relying on a browser's own (often absent) PIN-setup UI. It talks to the running `tpm-fido` daemon over a local Unix control socket (`$XDG_RUNTIME_DIR/tpm-fido.sock` by default) — it never touches the TPM, HID device, or on-disk stores directly.
 
 If `tpm-fido-tray` is found on `$PATH`, the `tpm-fido` daemon launches it automatically once its control socket is ready (pass `-no-tray` to disable this). It can also be launched manually or from an application menu.
 
@@ -36,7 +42,7 @@ Requires GTK3 and `libayatana-appindicator3` (or `libappindicator3`) at build an
 
 ## Status
 
-tpm-fido has been tested to work with Chrome and Firefox on Linux, including CTAP2 resident-key registration/authentication with PIN-based user verification against webauthn.io and GitHub.
+tpm-fido has been tested to work with Chrome and Firefox on Linux, including CTAP2 resident-key registration/authentication with PIN-based user verification against webauthn.io and GitHub, in both the default Windows Hello mode (authenticator-side PIN prompt) and the browser-collected clientPIN fallback — including that credentials registered in one mode authenticate in the other.
 
 ## Installation
 
