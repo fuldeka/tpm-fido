@@ -22,7 +22,7 @@ Discoverable credential metadata (rpId, user id/name, credential id, a per-crede
 
 By default, tpm-fido advertises CTAP 2.1 built-in user verification (`uv:true` + `pinUvAuthToken`, alongside `FIDO_2_1`) whenever a PIN is set. In this mode the browser shows **no PIN box**: it drives `getPinUvAuthTokenUsingUvWithPermissions` and tpm-fido collects the PIN in its own `pinentry` system dialog, verifying it against the same `pin-state.json` hash used by the browser-collected PIN path. This is the Windows-Hello / Touch-ID interaction model — the PIN prompt belongs to the authenticator, not the web page. Credentials are mode-agnostic: one registered while this mode was off (browser-collected PIN) authenticates unchanged while it's on, and vice versa.
 
-The mode is a persisted, per-user toggle (`$XDG_CONFIG_HOME/tpm-fido/uv-config.json`, override with `-uv-config <path>`), **on by default**, flipped live from the `tpm-fido-tray` menu ("Windows Hello mode") — no restart needed. Turn it off to fall back to plain clientPIN behaviour (the browser collects the PIN) if a browser update ever regresses internal UV over HID. The built-in UV backend is PIN-based today, but is structured behind an interface so a biometric backend could replace it without touching the CTAP2 layer.
+The mode is a persisted, per-user toggle (`$XDG_CONFIG_HOME/tpm-fido/uv-config.json`, override with `-uv-config <path>`), **on by default**, flipped live from the "Windows Hello mode" switch in the `tpm-fido-tray` manager window — no restart needed. Turn it off to fall back to plain clientPIN behaviour (the browser collects the PIN) if a browser update ever regresses internal UV over HID. The built-in UV backend is PIN-based today, but is structured behind an interface so a biometric backend could replace it without touching the CTAP2 layer.
 
 Non-resident (classic allowList-based) WebAuthn and legacy U2F both continue to work unchanged and require no local state.
 
@@ -34,7 +34,7 @@ Known limitations of the CTAP2 support:
 
 ## tpm-fido-tray
 
-`tpm-fido-tray` is an optional companion GUI: a system tray icon for setting/changing the PIN, viewing/deleting resident credentials, and toggling Windows Hello mode (the "Windows Hello mode" menu checkbox), without needing a CLI tool or relying on a browser's own (often absent) PIN-setup UI. It talks to the running `tpm-fido` daemon over a local Unix control socket (`$XDG_RUNTIME_DIR/tpm-fido.sock` by default) — it never touches the TPM, HID device, or on-disk stores directly.
+`tpm-fido-tray` is an optional companion GUI: a system tray icon that opens a manager window for setting/changing the PIN, toggling Windows Hello mode, viewing/deleting resident credentials, and clearing a PIN lockout (an "Unlock" button shown only while locked out), without needing a CLI tool or relying on a browser's own (often absent) PIN-setup UI. It talks to the running `tpm-fido` daemon over a local Unix control socket (`$XDG_RUNTIME_DIR/tpm-fido.sock` by default) — it never touches the TPM, HID device, or on-disk stores directly.
 
 If `tpm-fido-tray` is found on `$PATH`, the `tpm-fido` daemon launches it automatically once its control socket is ready (pass `-no-tray` to disable this). It can also be launched manually or from an application menu.
 
