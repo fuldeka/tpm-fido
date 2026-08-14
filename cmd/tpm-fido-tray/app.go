@@ -27,9 +27,11 @@ type app struct {
 	win  *gtk.Window
 	root *gtk.Box
 
-	statusLabel *gtk.Label
-	pinButton   *gtk.Button
-	rpList      *gtk.ListBox
+	statusLabel  *gtk.Label
+	pinButton    *gtk.Button
+	unlockButton *gtk.Button
+	helloSwitch  *gtk.Switch
+	rpList       *gtk.ListBox
 	credList    *gtk.ListBox
 	deleteBtn   *gtk.Button
 
@@ -37,6 +39,11 @@ type app struct {
 	selectedRPID string
 	creds        []credentialInfo
 	selectedCred string // base64 credential_id
+
+	// suppressHelloSignal is set while programmatically syncing helloSwitch
+	// so refresh-driven SetActive doesn't re-fire onHelloSwitchToggled and
+	// bounce a redundant write back to the daemon.
+	suppressHelloSignal bool
 }
 
 func newApp(win *gtk.Window) *app {
@@ -53,11 +60,36 @@ func newApp(win *gtk.Window) *app {
 	pinRow, _ := gtk.BoxNew(gtk.ORIENTATION_HORIZONTAL, 8)
 	a.statusLabel, _ = gtk.LabelNew("PIN status: checking...")
 	a.statusLabel.SetHAlign(gtk.ALIGN_START)
+	// Unlock button: only shown when the PIN is locked out (retries==0), as a
+	// non-destructive recovery path (resets the retry counter, keeps PIN and
+	// credentials). Hidden otherwise to avoid clutter.
+	a.unlockButton, _ = gtk.ButtonNewWithLabel("Unlock")
+	a.unlockButton.SetTooltipText("Clear the failed-attempt lockout without changing your PIN or credentials")
+	// Keep gtk.Widget.ShowAll (called when the window opens) from forcing the
+	// Unlock button visible; its visibility is driven solely by lock state in
+	// refreshPINStatus.
+	a.unlockButton.SetNoShowAll(true)
+	a.unlockButton.Connect("clicked", a.onUnlockClicked)
 	a.pinButton, _ = gtk.ButtonNewWithLabel("Set PIN")
 	a.pinButton.Connect("clicked", a.onPINButtonClicked)
 	pinRow.PackStart(a.statusLabel, true, true, 0)
+	pinRow.PackStart(a.unlockButton, false, false, 0)
 	pinRow.PackStart(a.pinButton, false, false, 0)
 	root.PackStart(pinRow, false, false, 0)
+
+	// Windows Hello mode row: authenticator-side PIN prompt (no browser PIN
+	// box) vs. plain browser-collected clientPIN.
+	helloRow, _ := gtk.BoxNew(gtk.ORIENTATION_HORIZONTAL, 8)
+	helloLabel, _ := gtk.LabelNew("Windows Hello mode")
+	helloLabel.SetHAlign(gtk.ALIGN_START)
+	helloLabel.SetTooltipText("When on, tpm-fido asks for your PIN in its own dialog instead of the browser's PIN box")
+	a.helloSwitch, _ = gtk.SwitchNew()
+	a.helloSwitch.SetHAlign(gtk.ALIGN_END)
+	a.helloSwitch.SetVAlign(gtk.ALIGN_CENTER)
+	a.helloSwitch.Connect("state-set", a.onHelloSwitchToggled)
+	helloRow.PackStart(helloLabel, true, true, 0)
+	helloRow.PackStart(a.helloSwitch, false, false, 0)
+	root.PackStart(helloRow, false, false, 0)
 
 	sep, _ := gtk.SeparatorNew(gtk.ORIENTATION_HORIZONTAL)
 	root.PackStart(sep, false, false, 4)
@@ -108,6 +140,7 @@ func (a *app) refresh() error {
 	if err := a.refreshPINStatus(); err != nil {
 		return err
 	}
+	a.refreshHelloSwitch()
 	return a.refreshRPs()
 }
 
@@ -121,14 +154,34 @@ func (a *app) refreshPINStatus() error {
 	if err := json.Unmarshal(resp.Result, &status); err != nil {
 		return err
 	}
+	locked := status.IsSet && status.RetriesLeft <= 0
 	if status.IsSet {
-		a.statusLabel.SetText(fmt.Sprintf("PIN is set (%d retries left)", status.RetriesLeft))
+		if locked {
+			a.statusLabel.SetText("PIN is LOCKED (too many wrong attempts)")
+		} else {
+			a.statusLabel.SetText(fmt.Sprintf("PIN is set (%d retries left)", status.RetriesLeft))
+		}
 		a.pinButton.SetLabel("Change PIN")
 	} else {
 		a.statusLabel.SetText("No PIN set")
 		a.pinButton.SetLabel("Set PIN")
 	}
+	// Unlock is only relevant (and only offered) while locked out.
+	a.unlockButton.SetVisible(locked)
 	return nil
+}
+
+// refreshHelloSwitch syncs the switch to the daemon's persisted state without
+// re-triggering onHelloSwitchToggled (guarded by suppressHelloSignal).
+func (a *app) refreshHelloSwitch() {
+	enabled, err := getInternalUV()
+	if err != nil {
+		// Leave the switch as-is; the daemon is unreachable.
+		return
+	}
+	a.suppressHelloSignal = true
+	a.helloSwitch.SetActive(enabled)
+	a.suppressHelloSignal = false
 }
 
 func (a *app) refreshRPs() error {
@@ -247,6 +300,38 @@ func (a *app) onDeleteClicked() {
 	a.refreshRPs()
 }
 
+// onHelloSwitchToggled writes the new Windows Hello mode state to the daemon.
+// Returning false lets GTK apply the visual state change. On failure it
+// reconciles the switch back to the daemon's actual state.
+func (a *app) onHelloSwitchToggled(_ *gtk.Switch, state bool) bool {
+	if a.suppressHelloSignal {
+		return false
+	}
+	if _, err := setInternalUV(state); err != nil {
+		a.showError(fmt.Sprintf("Could not change Windows Hello mode: %s", err))
+		a.refreshHelloSwitch()
+	}
+	return false
+}
+
+// onUnlockClicked clears a PIN lockout after confirmation. Non-destructive:
+// it resets the retry counter but keeps the PIN and all credentials.
+func (a *app) onUnlockClicked() {
+	confirm := gtk.MessageDialogNew(a.win, gtk.DIALOG_MODAL, gtk.MESSAGE_QUESTION, gtk.BUTTONS_YES_NO,
+		"Clear the PIN lockout?\n\nThis resets the failed-attempt counter so you can use your PIN again. Your PIN and credentials are kept unchanged. Only do this if you're sure the earlier failed attempts were your own.")
+	resp := confirm.Run()
+	confirm.Destroy()
+	if resp != gtk.RESPONSE_YES {
+		return
+	}
+
+	if _, err := call(methodResetPINRetries, nil); err != nil {
+		a.showError(fmt.Sprintf("Unlock failed: %s", err))
+		return
+	}
+	a.refreshPINStatus()
+}
+
 func (a *app) onPINButtonClicked() {
 	resp, err := call(methodPINStatus, nil)
 	if err != nil {
@@ -343,4 +428,6 @@ const (
 	methodPINStatus  = "PINStatus"
 	methodSetPIN     = "SetPIN"
 	methodChangePIN  = "ChangePIN"
+
+	methodResetPINRetries = "ResetPINRetries"
 )

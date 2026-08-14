@@ -28,6 +28,10 @@ const (
 	MethodPINStatus  = "PINStatus"
 	MethodSetPIN     = "SetPIN"
 	MethodChangePIN  = "ChangePIN"
+	// Clears a failed-attempt lockout (retry counter -> max) without
+	// changing the PIN or credentials. Recovery path for when the PIN got
+	// locked out and ChangePIN can no longer verify the old PIN.
+	MethodResetPINRetries = "ResetPINRetries"
 	// Internal-UV ("Hello mode") toggle.
 	MethodGetInternalUV = "GetInternalUV"
 	MethodSetInternalUV = "SetInternalUV"
@@ -155,6 +159,15 @@ func (s *server) handleCtlRequest(method string, params json.RawMessage) (interf
 		// PIN change, same as the ClientPIN changePIN subcommand.
 		s.setPinToken(nil)
 		return struct{}{}, nil
+
+	case MethodResetPINRetries:
+		if err := s.pins.ResetRetries(); err != nil {
+			return nil, err
+		}
+		return PINStatusResult{
+			IsSet:       s.pins.IsSet(),
+			RetriesLeft: s.pins.RetriesLeft(),
+		}, nil
 
 	case MethodGetInternalUV:
 		return internalUVResult{Enabled: s.uvcfg.InternalUV()}, nil

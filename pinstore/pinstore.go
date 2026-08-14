@@ -113,6 +113,24 @@ func (s *Store) SetPIN(hash []byte) error {
 	return s.persistLocked()
 }
 
+// ResetRetries clears the failed-attempt lockout by restoring the retry
+// counter to its maximum, without changing the PIN itself. Real CTAP2
+// authenticators only clear lockout via a full authenticatorReset (which
+// wipes the PIN and all credentials); this is a local-tool convenience that
+// keeps the PIN and credentials intact, appropriate because the store is a
+// local 0600 file and the actual key material stays TPM-sealed regardless of
+// the counter. Returns an error if no PIN is set (nothing to unlock).
+func (s *Store) ResetRetries() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if len(s.s.PINHash) == 0 {
+		return fmt.Errorf("no PIN set")
+	}
+	s.s.RetriesLeft = maxRetries
+	return s.persistLocked()
+}
+
 // Verify checks hash against the stored PIN hash, decrementing the retry
 // counter on failure and resetting it on success. Returns (true, nil) on
 // match, (false, nil) on mismatch, or a non-nil error if retries are
