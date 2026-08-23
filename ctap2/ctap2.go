@@ -206,6 +206,10 @@ const (
 	flagAT byte = 1 << 6
 )
 
+// InitialSignCount is the sign count for MakeCredential authData. Zero =
+// counter starts fresh, so RPs skip the increase check on first login.
+const InitialSignCount uint32 = 0
+
 // BuildAuthData constructs the CTAP2 authenticatorData structure. When
 // credID/pubKeyX/pubKeyY are non-nil the attestedCredentialData block
 // (AAGUID + credId + COSE public key) is included, as required for
@@ -532,6 +536,9 @@ const (
 	ClientPINSubSetPIN          = 0x03
 	ClientPINSubChangePIN       = 0x04
 	ClientPINSubGetPINToken     = 0x05
+	// CTAP 2.1 getPINToken with permissions; newer platforms use this
+	// instead of 0x05 when they saw pinUvAuthToken:true.
+	ClientPINSubGetPinUvAuthTokenUsingPIN = 0x09
 	// ClientPINSubGetUvToken (getPinUvAuthTokenUsingUvWithPermissions) is the
 	// CTAP 2.1 internal-UV token request: the browser asks us to mint a
 	// UV-backed pinUvAuthToken and we perform user verification on our own

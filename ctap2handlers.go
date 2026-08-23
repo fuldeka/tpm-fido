@@ -186,7 +186,7 @@ func (s *server) handleMakeCredential(parentCtx context.Context, token *fidohid.
 	// userVerified reflects an actual pinUvAuthParam check above, not just
 	// the pinentry presence tap -- UV must never be reported true unless a
 	// PIN was genuinely verified for this request.
-	authData, err := ctap2.BuildAuthData(req.RP.ID, true, userVerified, s.signer.Counter(), credID, pubKeyX, pubKeyY)
+	authData, err := ctap2.BuildAuthData(req.RP.ID, true, userVerified, ctap2.InitialSignCount, credID, pubKeyX, pubKeyY)
 	if err != nil {
 		log.Printf("BuildAuthData err: %s", err)
 		token.WriteCborResponse(parentCtx, evt, nil, ctap2.StatusOther)
@@ -585,7 +585,8 @@ func (s *server) handleClientPIN(parentCtx context.Context, token *fidohid.SoftT
 	}
 
 	switch req.SubCommand {
-	case ctap2.ClientPINSubSetPIN, ctap2.ClientPINSubChangePIN, ctap2.ClientPINSubGetPINToken:
+	case ctap2.ClientPINSubSetPIN, ctap2.ClientPINSubChangePIN,
+		ctap2.ClientPINSubGetPINToken, ctap2.ClientPINSubGetPinUvAuthTokenUsingPIN:
 		if req.PinUvAuthProtocol != 1 {
 			log.Printf("clientPIN subcommand 0x%02x: unsupported pinUvAuthProtocol %d", req.SubCommand, req.PinUvAuthProtocol)
 			token.WriteCborResponse(parentCtx, evt, nil, ctap2.StatusInvalidParameter)
@@ -619,7 +620,7 @@ func (s *server) handleClientPIN(parentCtx context.Context, token *fidohid.SoftT
 	case ctap2.ClientPINSubChangePIN:
 		s.handleChangePIN(parentCtx, token, evt, req)
 
-	case ctap2.ClientPINSubGetPINToken:
+	case ctap2.ClientPINSubGetPINToken, ctap2.ClientPINSubGetPinUvAuthTokenUsingPIN:
 		s.handleGetPINToken(parentCtx, token, evt, req)
 
 	case ctap2.ClientPINSubGetUVRetries:
