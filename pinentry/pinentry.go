@@ -13,6 +13,11 @@ import (
 	"github.com/foxcpp/go-assuan/pinentry"
 )
 
+// ConfirmTimeout is how long the presence-confirm dialog waits for a
+// click. Callers waiting on ConfirmPresence should use the same value so
+// they never give up before the dialog closes.
+const ConfirmTimeout = 30 * time.Second
+
 func New() *Pinentry {
 	return &Pinentry{}
 }
@@ -55,7 +60,9 @@ func (pe *Pinentry) ConfirmPresence(callerCtx context.Context, prompt string, ch
 	pe.mu.Lock()
 	defer pe.mu.Unlock()
 
-	timeout := 2 * time.Second
+	// Generous window: this dialog is also the fallback consent prompt when
+	// no PIN was verified, and missing it fails the whole ceremony.
+	timeout := ConfirmTimeout
 
 	if pe.activeRequest != nil {
 		if challengeParam != pe.activeRequest.challengeParam || applicationParam != pe.activeRequest.applicationParam {

@@ -12,6 +12,7 @@ import (
 	"github.com/psanford/tpm-fido/attestation"
 	"github.com/psanford/tpm-fido/ctap2"
 	"github.com/psanford/tpm-fido/fidohid"
+	"github.com/psanford/tpm-fido/pinentry"
 	"github.com/psanford/tpm-fido/pinprotocol"
 	"github.com/psanford/tpm-fido/residentstore"
 	"github.com/psanford/tpm-fido/uvmethod"
@@ -133,34 +134,13 @@ func (s *server) handleMakeCredential(parentCtx context.Context, token *fidohid.
 	rpIDHash := sha256.Sum256([]byte(req.RP.ID))
 	copy(applicationParam[:], rpIDHash[:])
 
-	pinResultCh, err := s.pe.ConfirmPresence(parentCtx, "FIDO Confirm Register", challengeParam, applicationParam)
-	if err != nil {
-		log.Printf("pinentry err: %s", err)
-		token.WriteCborResponse(parentCtx, evt, nil, ctap2.StatusOperationDenied)
-		return
-	}
-
-	ctx, cancel := context.WithTimeout(parentCtx, 30*time.Second)
-	defer cancel()
-
-	select {
-	case result := <-pinResultCh:
-		if !result.OK {
-			if result.Error != nil {
-				log.Printf("got pinentry result err: %s", result.Error)
-			}
-			token.WriteCborResponse(parentCtx, evt, nil, ctap2.StatusOperationDenied)
-			return
-		}
-		log.Printf("pinentry confirmed for MakeCredential site=%s", req.RP.ID)
-	case <-ctx.Done():
-		if parentCtx.Err() != nil {
-			log.Printf("MakeCredential canceled by platform for site=%s", req.RP.ID)
-			token.WriteCborResponse(parentCtx, evt, nil, ctap2.StatusKeepAliveCancel)
-			return
-		}
-		log.Printf("pinentry timed out (30s) for MakeCredential site=%s", req.RP.ID)
-		token.WriteCborResponse(parentCtx, evt, nil, ctap2.StatusOperationDenied)
+	// A verified PIN is the user gesture (Windows Hello style: one prompt
+	// total). Only fall back to a presence tap when no PIN was verified.
+	if userVerified {
+		s.markPresenceVerified()
+		log.Printf("presence satisfied by verified PIN for MakeCredential site=%s", req.RP.ID)
+	} else if !s.confirmPresence(parentCtx, token, evt,
+		"FIDO Confirm Register", challengeParam, applicationParam, "MakeCredential site="+req.RP.ID) {
 		return
 	}
 
@@ -311,37 +291,19 @@ func (s *server) handleGetAssertion(parentCtx context.Context, token *fidohid.So
 		return
 	}
 
-	if req.UserPresence {
+	// Same rule as MakeCredential: a verified PIN is the user gesture.
+	// Prompt only when the platform asked for presence AND no PIN was
+	// verified for this request (silent up=false probes stay silent).
+	if userVerified {
+		s.markPresenceVerified()
+		log.Printf("presence satisfied by verified PIN for GetAssertion site=%s", req.RPID)
+	} else if req.UserPresence {
 		var challengeParam, applicationParam [32]byte
 		copy(challengeParam[:], req.ClientDataHash)
 		copy(applicationParam[:], rpIDHash[:])
 
-		pinResultCh, err := s.pe.ConfirmPresence(parentCtx, "FIDO Confirm Auth", challengeParam, applicationParam)
-		if err != nil {
-			log.Printf("pinentry err: %s", err)
-			token.WriteCborResponse(parentCtx, evt, nil, ctap2.StatusOperationDenied)
-			return
-		}
-
-		ctx, cancel := context.WithTimeout(parentCtx, 30*time.Second)
-		defer cancel()
-
-		select {
-		case result := <-pinResultCh:
-			if !result.OK {
-				if result.Error != nil {
-					log.Printf("got pinentry result err: %s", result.Error)
-				}
-				token.WriteCborResponse(parentCtx, evt, nil, ctap2.StatusOperationDenied)
-				return
-			}
-		case <-ctx.Done():
-			if parentCtx.Err() != nil {
-				log.Printf("GetAssertion canceled by platform for site=%s", req.RPID)
-				token.WriteCborResponse(parentCtx, evt, nil, ctap2.StatusKeepAliveCancel)
-				return
-			}
-			token.WriteCborResponse(parentCtx, evt, nil, ctap2.StatusOperationDenied)
+		if !s.confirmPresence(parentCtx, token, evt,
+			"FIDO Confirm Auth", challengeParam, applicationParam, "GetAssertion site="+req.RPID) {
 			return
 		}
 	} else {
@@ -908,6 +870,67 @@ func trimPINPadding(padded []byte) string {
 		i--
 	}
 	return string(padded[:i])
+}
+
+// presenceCacheWindow is how long a successful presence tap covers
+// subsequent requests. Mirrors what hardware keys do so back-to-back
+// ceremonies don't demand a fresh tap every time.
+const presenceCacheWindow = 15 * time.Second
+
+func (s *server) presenceRecentlyVerified() bool {
+	s.lastPresenceMu.Lock()
+	defer s.lastPresenceMu.Unlock()
+	return time.Since(s.lastPresence) < presenceCacheWindow
+}
+
+func (s *server) markPresenceVerified() {
+	s.lastPresenceMu.Lock()
+	s.lastPresence = time.Now()
+	s.lastPresenceMu.Unlock()
+}
+
+// confirmPresence shows the consent dialog unless a very recent tap already
+// covers this request. Returns true when presence is satisfied.
+func (s *server) confirmPresence(parentCtx context.Context, token *fidohid.SoftToken,
+	evt fidohid.AuthEvent, prompt string, challengeParam, applicationParam [32]byte, site string) bool {
+
+	if s.presenceRecentlyVerified() {
+		log.Printf("presence cached for %s, skipping prompt", site)
+		return true
+	}
+
+	pinResultCh, err := s.pe.ConfirmPresence(parentCtx, prompt, challengeParam, applicationParam)
+	if err != nil {
+		log.Printf("pinentry err: %s", err)
+		token.WriteCborResponse(parentCtx, evt, nil, ctap2.StatusOperationDenied)
+		return false
+	}
+
+	ctx, cancel := context.WithTimeout(parentCtx, pinentry.ConfirmTimeout+2*time.Second)
+	defer cancel()
+
+	select {
+	case result := <-pinResultCh:
+		if !result.OK {
+			if result.Error != nil {
+				log.Printf("got pinentry result err: %s", result.Error)
+			}
+			token.WriteCborResponse(parentCtx, evt, nil, ctap2.StatusOperationDenied)
+			return false
+		}
+		log.Printf("pinentry confirmed for %s", site)
+		s.markPresenceVerified()
+		return true
+	case <-ctx.Done():
+		if parentCtx.Err() != nil {
+			log.Printf("%s canceled by platform", site)
+			token.WriteCborResponse(parentCtx, evt, nil, ctap2.StatusKeepAliveCancel)
+			return false
+		}
+		log.Printf("pinentry timed out (30s) for %s", site)
+		token.WriteCborResponse(parentCtx, evt, nil, ctap2.StatusOperationDenied)
+		return false
+	}
 }
 
 // verifyPinToken checks pinUvAuthParam against the current pinUvAuthToken
