@@ -11,6 +11,7 @@ import (
 	"flag"
 	"log"
 	"math/big"
+	"os"
 	"os/exec"
 	"sync"
 	"time"
@@ -42,6 +43,10 @@ var noTray = flag.Bool("no-tray", false, "don't launch the tpm-fido-tray compani
 
 func main() {
 	flag.Parse()
+	if err := acquireSingleInstanceLock(); err != nil {
+		log.Println(err)
+		os.Exit(1)
+	}
 	s := newServer()
 	s.run()
 }
@@ -95,6 +100,12 @@ type server struct {
 	// (ChangePIN invalidates it from the latter).
 	pinTokenMu sync.Mutex
 	pinToken   []byte
+
+	// lastPresence caches a recent successful presence tap so back-to-back
+	// ceremonies (register -> auto-login) don't each demand their own click.
+	// Deliberately global: within the window, any RP benefits.
+	lastPresenceMu sync.Mutex
+	lastPresence   time.Time
 }
 
 func (s *server) setPinToken(tok []byte) {
